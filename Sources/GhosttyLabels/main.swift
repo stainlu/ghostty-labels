@@ -148,7 +148,8 @@ private final class LabelController {
         }
 
         let ghosttyFrontmost = isGhosttyFrontmost()
-        guard alwaysShow || ghosttyFrontmost else {
+        let helperFrontmost = isHelperFrontmost()
+        guard alwaysShow || ghosttyFrontmost || helperFrontmost else {
             removeAllOverlays()
             return
         }
@@ -212,10 +213,6 @@ private final class LabelController {
 
     private func editLabel(for windowID: CGWindowID, currentLabel: String) {
         isEditing = true
-        for overlay in overlays.values {
-            overlay.orderOut(nil)
-        }
-
         defer {
             isEditing = false
             activateGhostty()
@@ -256,6 +253,10 @@ private final class LabelController {
 
     private func isGhosttyFrontmost() -> Bool {
         NSWorkspace.shared.frontmostApplication?.localizedName == "Ghostty"
+    }
+
+    private func isHelperFrontmost() -> Bool {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier
     }
 
     private func activateGhostty() {
