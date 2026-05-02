@@ -93,6 +93,7 @@ private final class LabelWindow: NSWindow {
     let badgeView: BadgeView
     var ghosttyWindowID: CGWindowID
     var onEdit: ((CGWindowID, String) -> Void)?
+    var onMouseDown: ((NSPoint) -> Void)?
 
     init(windowID: CGWindowID, text: String, frame: NSRect) {
         self.ghosttyWindowID = windowID
@@ -126,6 +127,14 @@ private final class LabelWindow: NSWindow {
     override func mouseDown(with event: NSEvent) {
         onEdit?(ghosttyWindowID, badgeView.text)
     }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown {
+            onMouseDown?(NSEvent.mouseLocation)
+        }
+
+        super.sendEvent(event)
+    }
 }
 
 private final class LabelController {
@@ -136,8 +145,11 @@ private final class LabelController {
     private var isEditing = false
     private var lastActiveWindowID: CGWindowID?
     private var timer: Timer?
+    private var eventMonitorTokens: [Any] = []
 
     func start() {
+        installEventMonitors()
+
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -191,6 +203,9 @@ private final class LabelController {
                 overlay.onEdit = { [weak self] windowID, currentLabel in
                     self?.editLabel(for: windowID, currentLabel: currentLabel)
                 }
+                overlay.onMouseDown = { [weak self] point in
+                    _ = self?.editLabelIfNeeded(at: point)
+                }
                 overlays[ghosttyWindow.id] = overlay
             }
         }
@@ -213,6 +228,44 @@ private final class LabelController {
 
     private func labelText(for window: GhosttyWindow) -> String {
         customLabels[window.id] ?? window.title
+    }
+
+    private func installEventMonitors() {
+        eventMonitorTokens.append(
+            NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                if self?.editLabelIfNeeded(at: NSEvent.mouseLocation) == true {
+                    return nil
+                }
+
+                return event
+            } as Any
+        )
+
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown, handler: { [weak self] _ in
+            DispatchQueue.main.async {
+                _ = self?.editLabelIfNeeded(at: NSEvent.mouseLocation)
+            }
+        }) {
+            eventMonitorTokens.append(globalMonitor)
+        }
+    }
+
+    private func editLabelIfNeeded(at point: NSPoint) -> Bool {
+        guard !isEditing else {
+            return true
+        }
+
+        let candidates = overlays.values.filter { overlay in
+            overlay.isVisible && overlay.frame.contains(point)
+        }
+
+        guard !candidates.isEmpty else {
+            return false
+        }
+
+        let target = candidates.first { $0.ghosttyWindowID == lastActiveWindowID } ?? candidates[0]
+        editLabel(for: target.ghosttyWindowID, currentLabel: target.badgeView.text)
+        return true
     }
 
     private func editLabel(for windowID: CGWindowID, currentLabel: String) {
