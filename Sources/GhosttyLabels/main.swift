@@ -1,25 +1,28 @@
+import ApplicationServices
 import Cocoa
 import CoreGraphics
 
-private struct GhosttyWindow: Hashable {
+private typealias SplitID = String
+
+private struct GhosttyWindow {
     let id: CGWindowID
     let title: String
     let bounds: CGRect
 }
 
-private typealias WindowGroupID = String
-
-private struct DetectedGhosttyWindowGroup {
-    let windowIDs: Set<CGWindowID>
+private struct DetectedSplit {
     let title: String
     let bounds: CGRect
+    let windowBounds: CGRect
+    let isFocused: Bool
 }
 
-private struct GhosttyWindowGroup {
-    let id: WindowGroupID
-    let windowIDs: Set<CGWindowID>
+private struct GhosttySplit {
+    let id: SplitID
     let title: String
     let bounds: CGRect
+    let windowBounds: CGRect
+    let isFocused: Bool
 }
 
 private enum LabelPosition: String {
@@ -37,15 +40,11 @@ private final class BadgeView: NSView {
     var onClick: (() -> Void)?
 
     var text: String {
-        didSet {
-            needsDisplay = true
-        }
+        didSet { needsDisplay = true }
     }
 
     var isActive: Bool = true {
-        didSet {
-            needsDisplay = true
-        }
+        didSet { needsDisplay = true }
     }
 
     init(text: String) {
@@ -106,12 +105,12 @@ private final class BadgeView: NSView {
 
 private final class LabelWindow: NSPanel {
     let badgeView: BadgeView
-    var groupID: WindowGroupID
-    var onEdit: ((WindowGroupID, String) -> Void)?
+    var splitID: SplitID
+    var onEdit: ((SplitID, String) -> Void)?
     var onMouseDown: ((NSPoint) -> Void)?
 
-    init(groupID: WindowGroupID, text: String, frame: NSRect) {
-        self.groupID = groupID
+    init(splitID: SplitID, text: String, frame: NSRect) {
+        self.splitID = splitID
         self.badgeView = BadgeView(text: text)
         super.init(
             contentRect: frame,
@@ -129,20 +128,18 @@ private final class LabelWindow: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         level = .statusBar
         badgeView.onClick = { [weak self] in
-            guard let self else {
-                return
-            }
-            self.onEdit?(self.groupID, self.badgeView.text)
+            guard let self else { return }
+            self.onEdit?(self.splitID, self.badgeView.text)
         }
         contentView = badgeView
     }
 
     override var canBecomeKey: Bool {
-        true
+        false
     }
 
     override func mouseDown(with event: NSEvent) {
-        onEdit?(groupID, badgeView.text)
+        onEdit?(splitID, badgeView.text)
     }
 
     override func sendEvent(_ event: NSEvent) {
@@ -155,29 +152,33 @@ private final class LabelWindow: NSPanel {
 }
 
 private final class LabelController {
-    private var overlays: [WindowGroupID: LabelWindow] = [:]
-    private var windowLabels: [WindowGroupID: String] = [:]
-    private var windowIDToGroupID: [CGWindowID: WindowGroupID] = [:]
-    private var knownBoundsByGroupID: [WindowGroupID: CGRect] = [:]
-    private var knownWindowIDsByGroupID: [WindowGroupID: Set<CGWindowID>] = [:]
-    private var nextWindowGroupNumber = 1
+    private var overlays: [SplitID: LabelWindow] = [:]
+    private var splitLabels: [SplitID: String] = [:]
+    private var knownBoundsBySplitID: [SplitID: CGRect] = [:]
+    private var knownWindowBoundsBySplitID: [SplitID: CGRect] = [:]
+    private var nextSplitNumber = 1
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
     private var isEditing = false
-    private var pendingEditGroupID: WindowGroupID?
-    private var lastActiveGroupID: WindowGroupID?
+    private var pendingEditSplitID: SplitID?
+    private var lastActiveSplitID: SplitID?
     private var timer: Timer?
     private var eventMonitorTokens: [Any] = []
+    private var warnedAboutAccessibility = false
+    private var lastReportedSplitCount: Int?
+    private var lastAXWindowErrorLogTime = Date.distantPast
 
     func start() {
         installEventMonitors()
+        _ = hasAccessibilityPermission()
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.refresh()
         }
 
         refresh()
-        print("ghostty-labels running. Set Ghostty tab titles with cmd+ctrl+l. Stop with ctrl+c.")
+        log("ghostty-labels: bundle=\(Bundle.main.bundleIdentifier ?? "none") executable=\(Bundle.main.executablePath ?? "unknown")")
+        log("ghostty-labels running. Click a split label to edit it. Stop with ctrl+c.")
     }
 
     private func refresh() {
@@ -192,57 +193,57 @@ private final class LabelController {
             return
         }
 
-        let groups = assignStableIDs(to: detectPhysicalWindows(visibleGhosttyWindows()))
-        let liveIDs = Set(groups.map(\.id))
+        let detectedSplits = detectGhosttySplits()
+        if lastReportedSplitCount != detectedSplits.count {
+            lastReportedSplitCount = detectedSplits.count
+            log("ghostty-labels: detected \(detectedSplits.count) Ghostty split pane(s)")
+        }
+
+        let splits = assignStableIDs(to: detectedSplits)
+        let liveIDs = Set(splits.map(\.id))
 
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
             overlays[staleID]?.close()
             overlays.removeValue(forKey: staleID)
-            windowLabels.removeValue(forKey: staleID)
+            splitLabels.removeValue(forKey: staleID)
         }
 
-        // CGWindowListCopyWindowInfo returns windows front-to-back. Ghostty uses
-        // native macOS tabs, so multiple tab "windows" can share one frame; after
-        // grouping, the first group is the selected physical Ghostty window.
         if ghosttyFrontmost {
-            lastActiveGroupID = groups.first?.id
+            lastActiveSplitID = splits.first(where: \.isFocused)?.id ?? splits.first?.id
         }
-        let activeGroupID = liveIDs.contains(lastActiveGroupID ?? "") ? lastActiveGroupID : groups.first?.id
+        let activeSplitID = liveIDs.contains(lastActiveSplitID ?? "") ? lastActiveSplitID : splits.first?.id
 
-        var nextWindowIDToGroupID: [CGWindowID: WindowGroupID] = [:]
-        for group in groups {
-            let label = labelText(for: group)
-            let frame = labelFrame(for: group, label: label)
-            let isActiveWindow = group.id == activeGroupID
-            group.windowIDs.forEach { nextWindowIDToGroupID[$0] = group.id }
+        for split in splits {
+            let label = labelText(for: split)
+            let frame = labelFrame(for: split, label: label)
+            let isActive = split.id == activeSplitID
 
-            if let overlay = overlays[group.id] {
-                overlay.groupID = group.id
+            if let overlay = overlays[split.id] {
+                overlay.splitID = split.id
                 overlay.badgeView.text = label
-                overlay.badgeView.isActive = isActiveWindow
+                overlay.badgeView.isActive = isActive
                 overlay.alphaValue = 1
                 overlay.setFrame(frame, display: true)
             } else {
-                let overlay = LabelWindow(groupID: group.id, text: label, frame: frame)
-                overlay.badgeView.isActive = isActiveWindow
+                let overlay = LabelWindow(splitID: split.id, text: label, frame: frame)
+                overlay.badgeView.isActive = isActive
                 overlay.alphaValue = 1
-                overlay.onEdit = { [weak self] groupID, currentLabel in
-                    self?.scheduleEditLabel(for: groupID, currentLabel: currentLabel)
+                overlay.onEdit = { [weak self] splitID, currentLabel in
+                    self?.scheduleEditLabel(for: splitID, currentLabel: currentLabel)
                 }
                 overlay.onMouseDown = { [weak self] point in
                     _ = self?.editLabelIfNeeded(at: point)
                 }
-                overlays[group.id] = overlay
+                overlays[split.id] = overlay
             }
         }
-        windowIDToGroupID = nextWindowIDToGroupID
 
-        for group in groups where group.id != activeGroupID {
-            overlays[group.id]?.orderFrontRegardless()
+        for split in splits where split.id != activeSplitID {
+            overlays[split.id]?.orderFrontRegardless()
         }
 
-        if let activeGroupID {
-            overlays[activeGroupID]?.orderFrontRegardless()
+        if let activeSplitID {
+            overlays[activeSplitID]?.orderFrontRegardless()
         }
     }
 
@@ -253,21 +254,13 @@ private final class LabelController {
         overlays.removeAll()
     }
 
-    private func labelText(for group: GhosttyWindowGroup) -> String {
-        if let label = windowLabels[group.id] {
+    private func labelText(for split: GhosttySplit) -> String {
+        if let label = splitLabels[split.id] {
             return label
         }
 
-        for windowID in group.windowIDs {
-            if let previousGroupID = windowIDToGroupID[windowID],
-               let previousLabel = windowLabels[previousGroupID] {
-                windowLabels[group.id] = previousLabel
-                return previousLabel
-            }
-        }
-
-        windowLabels[group.id] = group.title
-        return group.title
+        splitLabels[split.id] = split.title
+        return split.title
     }
 
     private func installEventMonitors() {
@@ -291,7 +284,7 @@ private final class LabelController {
     }
 
     private func editLabelIfNeeded(at point: NSPoint) -> Bool {
-        guard !isEditing, pendingEditGroupID == nil else {
+        guard !isEditing, pendingEditSplitID == nil else {
             return true
         }
 
@@ -303,28 +296,28 @@ private final class LabelController {
             return false
         }
 
-        let target = candidates.first { $0.groupID == lastActiveGroupID } ?? candidates[0]
-        scheduleEditLabel(for: target.groupID, currentLabel: target.badgeView.text)
+        let target = candidates.first { $0.splitID == lastActiveSplitID } ?? candidates[0]
+        scheduleEditLabel(for: target.splitID, currentLabel: target.badgeView.text)
         return true
     }
 
-    private func scheduleEditLabel(for groupID: WindowGroupID, currentLabel: String) {
-        guard pendingEditGroupID == nil, !isEditing else {
+    private func scheduleEditLabel(for splitID: SplitID, currentLabel: String) {
+        guard pendingEditSplitID == nil, !isEditing else {
             return
         }
 
-        pendingEditGroupID = groupID
+        pendingEditSplitID = splitID
         DispatchQueue.main.async { [weak self] in
             guard let self else {
                 return
             }
 
-            self.pendingEditGroupID = nil
-            self.editLabel(for: groupID, currentLabel: currentLabel)
+            self.pendingEditSplitID = nil
+            self.editLabel(for: splitID, currentLabel: currentLabel)
         }
     }
 
-    private func editLabel(for groupID: WindowGroupID, currentLabel: String) {
+    private func editLabel(for splitID: SplitID, currentLabel: String) {
         isEditing = true
         defer {
             isEditing = false
@@ -335,11 +328,11 @@ private final class LabelController {
         NSApp.activate(ignoringOtherApps: true)
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        input.stringValue = windowLabels[groupID] ?? currentLabel
+        input.stringValue = splitLabels[splitID] ?? currentLabel
 
         let alert = NSAlert()
-        alert.messageText = "Edit Ghostty Label"
-        alert.informativeText = "This label belongs to the Ghostty window, not the selected tab."
+        alert.messageText = "Edit Ghostty Split Label"
+        alert.informativeText = "This label belongs to one Ghostty split pane."
         alert.accessoryView = input
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Reset")
@@ -353,16 +346,125 @@ private final class LabelController {
         switch response {
         case .alertFirstButtonReturn:
             let label = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if label.isEmpty {
-                windowLabels[groupID] = "Ghostty"
-            } else {
-                windowLabels[groupID] = label
-            }
+            splitLabels[splitID] = label.isEmpty ? "Ghostty" : label
         case .alertSecondButtonReturn:
-            windowLabels[groupID] = "Ghostty"
+            splitLabels[splitID] = "Ghostty"
         default:
             break
         }
+    }
+
+    private func detectGhosttySplits() -> [DetectedSplit] {
+        _ = hasAccessibilityPermission()
+
+        guard let app = ghosttyApplication() else {
+            return []
+        }
+
+        let visibleWindows = visibleGhosttyWindows()
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        let focusedFrame = axFrame(axElement(axApp, kAXFocusedUIElementAttribute))
+        let axWindowResult = axAttributeResult(axApp, kAXWindowsAttribute)
+        let axWindows = axWindowResult.value as? [AXUIElement] ?? []
+        if (axWindowResult.error != .success || axWindows.isEmpty) &&
+            Date().timeIntervalSince(lastAXWindowErrorLogTime) > 5 {
+            lastAXWindowErrorLogTime = Date()
+            log("ghostty-labels: ax windows error=\(axWindowResult.error.rawValue) trusted=\(AXIsProcessTrusted()) visibleWindows=\(visibleWindows.count) axWindows=\(axWindows.count)")
+        }
+
+        return axWindows.flatMap { axWindow -> [DetectedSplit] in
+            guard let windowFrame = axFrame(axWindow),
+                  visibleWindows.contains(where: { samePhysicalWindow($0.bounds, windowFrame) }) else {
+                return []
+            }
+
+            let scrollFrames = uniqueFrames(terminalScrollAreaFrames(in: axWindow, windowFrame: windowFrame))
+            if scrollFrames.isEmpty {
+                return []
+            }
+
+            return scrollFrames.map { frame in
+                DetectedSplit(
+                    title: "Ghostty",
+                    bounds: frame,
+                    windowBounds: windowFrame,
+                    isFocused: focusedFrame.map { samePhysicalWindow($0, frame) || intersectionOverUnion($0, frame) > 0.8 } ?? false
+                )
+            }
+        }
+    }
+
+    private func terminalScrollAreaFrames(in root: AXUIElement, windowFrame: CGRect) -> [CGRect] {
+        var frames: [CGRect] = []
+
+        func walk(_ element: AXUIElement) {
+            let role = axString(element, kAXRoleAttribute)
+            if role == "AXScrollArea",
+               let frame = axFrame(element),
+               frame.width >= 120,
+               frame.height >= 80,
+               windowFrame.intersects(frame) {
+                frames.append(frame)
+            }
+
+            for child in axElements(element, kAXChildrenAttribute) {
+                walk(child)
+            }
+        }
+
+        walk(root)
+        return frames
+    }
+
+    private func assignStableIDs(to detectedSplits: [DetectedSplit]) -> [GhosttySplit] {
+        var usedIDs = Set<SplitID>()
+        var splits: [GhosttySplit] = []
+
+        for detectedSplit in detectedSplits {
+            let splitID = bestExistingSplitID(for: detectedSplit, excluding: usedIDs) ?? newSplitID()
+            usedIDs.insert(splitID)
+            splits.append(
+                GhosttySplit(
+                    id: splitID,
+                    title: detectedSplit.title,
+                    bounds: detectedSplit.bounds,
+                    windowBounds: detectedSplit.windowBounds,
+                    isFocused: detectedSplit.isFocused
+                )
+            )
+        }
+
+        knownBoundsBySplitID = Dictionary(uniqueKeysWithValues: splits.map { ($0.id, $0.bounds) })
+        knownWindowBoundsBySplitID = Dictionary(uniqueKeysWithValues: splits.map { ($0.id, $0.windowBounds) })
+        return splits
+    }
+
+    private func bestExistingSplitID(for detectedSplit: DetectedSplit, excluding usedIDs: Set<SplitID>) -> SplitID? {
+        var bestMatch: (id: SplitID, score: CGFloat)?
+
+        for (splitID, previousBounds) in knownBoundsBySplitID where !usedIDs.contains(splitID) {
+            let previousWindowBounds = knownWindowBoundsBySplitID[splitID] ?? .null
+            let sameWindowScore = samePhysicalWindow(previousWindowBounds, detectedSplit.windowBounds) ? CGFloat(600) : 0
+            let windowOverlapScore = intersectionOverUnion(previousWindowBounds, detectedSplit.windowBounds) * 300
+            let splitOverlapScore = intersectionOverUnion(previousBounds, detectedSplit.bounds) * 1000
+            let splitFrameScore = samePhysicalWindow(previousBounds, detectedSplit.bounds) ? CGFloat(500) : 0
+            let score = sameWindowScore + windowOverlapScore + splitOverlapScore + splitFrameScore
+
+            if bestMatch == nil || score > bestMatch!.score {
+                bestMatch = (splitID, score)
+            }
+        }
+
+        guard let bestMatch, bestMatch.score >= 250 else {
+            return nil
+        }
+
+        return bestMatch.id
+    }
+
+    private func newSplitID() -> SplitID {
+        defer { nextSplitNumber += 1 }
+        return "split-\(nextSplitNumber)"
     }
 
     private func isGhosttyFrontmost() -> Bool {
@@ -374,119 +476,29 @@ private final class LabelController {
     }
 
     private func activateGhostty() {
-        NSWorkspace.shared.runningApplications
-            .first { $0.localizedName == "Ghostty" }?
-            .activate(options: [.activateIgnoringOtherApps])
+        ghosttyApplication()?.activate(options: [.activateIgnoringOtherApps])
     }
 
-    private func assignStableIDs(to detectedGroups: [DetectedGhosttyWindowGroup]) -> [GhosttyWindowGroup] {
-        var usedIDs = Set<WindowGroupID>()
-        var groups: [GhosttyWindowGroup] = []
-
-        for detectedGroup in detectedGroups {
-            let groupID = bestExistingGroupID(for: detectedGroup, excluding: usedIDs) ?? newWindowGroupID()
-            usedIDs.insert(groupID)
-            groups.append(
-                GhosttyWindowGroup(
-                    id: groupID,
-                    windowIDs: detectedGroup.windowIDs,
-                    title: detectedGroup.title,
-                    bounds: detectedGroup.bounds
-                )
-            )
-        }
-
-        knownBoundsByGroupID = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.bounds) })
-        knownWindowIDsByGroupID = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.windowIDs) })
-        return groups
-    }
-
-    private func bestExistingGroupID(
-        for detectedGroup: DetectedGhosttyWindowGroup,
-        excluding usedIDs: Set<WindowGroupID>
-    ) -> WindowGroupID? {
-        var bestMatch: (id: WindowGroupID, score: CGFloat)?
-
-        for (groupID, previousBounds) in knownBoundsByGroupID where !usedIDs.contains(groupID) {
-            let previousWindowIDs = knownWindowIDsByGroupID[groupID] ?? []
-            let hasSharedWindowID = !previousWindowIDs.isDisjoint(with: detectedGroup.windowIDs)
-            let frameScore = samePhysicalWindow(previousBounds, detectedGroup.bounds)
-                ? CGFloat(250)
-                : intersectionOverUnion(previousBounds, detectedGroup.bounds) * 100
-            let idScore = hasSharedWindowID ? CGFloat(1000) : 0
-            let score = frameScore + idScore
-
-            if bestMatch == nil || score > bestMatch!.score {
-                bestMatch = (groupID, score)
-            }
-        }
-
-        guard let bestMatch, bestMatch.score >= 50 else {
-            return nil
-        }
-
-        return bestMatch.id
-    }
-
-    private func newWindowGroupID() -> WindowGroupID {
-        defer {
-            nextWindowGroupNumber += 1
-        }
-
-        return "window-\(nextWindowGroupNumber)"
-    }
-
-    private func detectPhysicalWindows(_ windows: [GhosttyWindow]) -> [DetectedGhosttyWindowGroup] {
-        var groupedWindows: [[GhosttyWindow]] = []
-
-        for window in windows {
-            if let index = groupedWindows.firstIndex(where: { existingGroup in
-                guard let first = existingGroup.first else {
-                    return false
-                }
-
-                return samePhysicalWindow(first.bounds, window.bounds)
-            }) {
-                groupedWindows[index].append(window)
-            } else {
-                groupedWindows.append([window])
-            }
-        }
-
-        return groupedWindows.map { group in
-            let ids = Set(group.map(\.id))
-            let bounds = group.reduce(group[0].bounds) { partial, window in
-                partial.union(window.bounds)
-            }
-
-            return DetectedGhosttyWindowGroup(
-                windowIDs: ids,
-                title: group[0].title,
-                bounds: bounds
-            )
+    private func ghosttyApplication() -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first {
+            $0.bundleIdentifier == "com.mitchellh.ghostty" || $0.localizedName == "Ghostty"
         }
     }
 
-    private func samePhysicalWindow(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        abs(lhs.minX - rhs.minX) <= 8 &&
-            abs(lhs.minY - rhs.minY) <= 8 &&
-            abs(lhs.width - rhs.width) <= 16 &&
-            abs(lhs.height - rhs.height) <= 16
-    }
-
-    private func intersectionOverUnion(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        let intersection = lhs.intersection(rhs)
-        guard !intersection.isNull, !intersection.isEmpty else {
-            return 0
+    private func hasAccessibilityPermission() -> Bool {
+        guard !AXIsProcessTrusted() else {
+            return true
         }
 
-        let intersectionArea = intersection.width * intersection.height
-        let unionArea = lhs.width * lhs.height + rhs.width * rhs.height - intersectionArea
-        guard unionArea > 0 else {
-            return 0
+        if !warnedAboutAccessibility {
+            warnedAboutAccessibility = true
+            let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+            let options = [promptKey: true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+            log("ghostty-labels: Accessibility permission is required for split-level labels. Grant it to ghostty-labels, then restart this helper.")
         }
 
-        return intersectionArea / unionArea
+        return false
     }
 
     private func visibleGhosttyWindows() -> [GhosttyWindow] {
@@ -519,20 +531,20 @@ private final class LabelController {
         }
     }
 
-    private func labelFrame(for window: GhosttyWindowGroup, label: String) -> NSRect {
+    private func labelFrame(for split: GhosttySplit, label: String) -> NSRect {
         let size = badgeSize(for: label)
         let x: CGFloat
 
         switch position {
         case .topLeft:
-            x = window.bounds.minX + 18
+            x = split.bounds.minX + 18
         case .topCenter:
-            x = window.bounds.midX - size.width / 2
+            x = split.bounds.midX - size.width / 2
         case .topRight:
-            x = window.bounds.maxX - size.width - 18
+            x = split.bounds.maxX - size.width - 18
         }
 
-        let y = appKitY(forTopEdgeOf: window.bounds) - size.height - 42
+        let y = appKitY(forTopEdgeOf: split.bounds) - size.height - 12
         return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
 
@@ -564,6 +576,112 @@ private final class LabelController {
         let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
         let distanceFromDisplayTop = cgBounds.minY - displayBounds.minY
         return screen.frame.maxY - distanceFromDisplayTop
+    }
+}
+
+private func axAttribute(_ element: AXUIElement?, _ attribute: String) -> AnyObject? {
+    axAttributeResult(element, attribute).value
+}
+
+private func axAttributeResult(_ element: AXUIElement?, _ attribute: String) -> (value: AnyObject?, error: AXError) {
+    guard let element else {
+        return (nil, .failure)
+    }
+
+    var value: AnyObject?
+    let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+    return (error == .success ? value : nil, error)
+}
+
+private func axElements(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
+    axAttribute(element, attribute) as? [AXUIElement] ?? []
+}
+
+private func axElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+    guard let rawElement = axAttribute(element, attribute),
+          CFGetTypeID(rawElement) == AXUIElementGetTypeID()
+    else {
+        return nil
+    }
+
+    return (rawElement as! AXUIElement)
+}
+
+private func axString(_ element: AXUIElement, _ attribute: String) -> String {
+    axAttribute(element, attribute).map { String(describing: $0) } ?? ""
+}
+
+private func axFrame(_ element: AXUIElement?) -> CGRect? {
+    guard let element,
+          let rawPosition = axAttribute(element, kAXPositionAttribute),
+          let rawSize = axAttribute(element, kAXSizeAttribute),
+          CFGetTypeID(rawPosition) == AXValueGetTypeID(),
+          CFGetTypeID(rawSize) == AXValueGetTypeID()
+    else {
+        return nil
+    }
+
+    let positionValue = rawPosition as! AXValue
+    let sizeValue = rawSize as! AXValue
+    var point = CGPoint.zero
+    var size = CGSize.zero
+    guard
+        AXValueGetValue(positionValue, .cgPoint, &point),
+        AXValueGetValue(sizeValue, .cgSize, &size)
+    else {
+        return nil
+    }
+
+    return CGRect(origin: point, size: size)
+}
+
+private func uniqueFrames(_ frames: [CGRect]) -> [CGRect] {
+    var result: [CGRect] = []
+
+    for frame in frames {
+        if !result.contains(where: { samePhysicalWindow($0, frame) }) {
+            result.append(frame)
+        }
+    }
+
+    return result
+}
+
+private func samePhysicalWindow(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+    abs(lhs.minX - rhs.minX) <= 8 &&
+        abs(lhs.minY - rhs.minY) <= 8 &&
+        abs(lhs.width - rhs.width) <= 16 &&
+        abs(lhs.height - rhs.height) <= 16
+}
+
+private func intersectionOverUnion(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+    let intersection = lhs.intersection(rhs)
+    guard !intersection.isNull, !intersection.isEmpty else {
+        return 0
+    }
+
+    let intersectionArea = intersection.width * intersection.height
+    let unionArea = lhs.width * lhs.height + rhs.width * rhs.height - intersectionArea
+    guard unionArea > 0 else {
+        return 0
+    }
+
+    return intersectionArea / unionArea
+}
+
+private func log(_ message: String) {
+    if let data = (message + "\n").data(using: .utf8) {
+        FileHandle.standardError.write(data)
+        let logURL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Logs/ghostty-labels-debug.log")
+        if FileManager.default.fileExists(atPath: logURL.path),
+           let file = try? FileHandle(forWritingTo: logURL) {
+            defer { try? file.close() }
+            _ = try? file.seekToEnd()
+            try? file.write(contentsOf: data)
+        } else {
+            try? data.write(to: logURL, options: .atomic)
+        }
     }
 }
 

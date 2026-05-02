@@ -2,9 +2,9 @@
 
 A tiny macOS overlay helper for Ghostty.
 
-Ghostty does not currently expose a plugin API for custom titlebar/window UI. This helper runs beside Ghostty, watches visible Ghostty windows, and draws a small floating label on each physical Ghostty window.
+Ghostty does not currently expose a plugin API for custom titlebar/window UI. This helper runs beside Ghostty, watches visible Ghostty split panes through macOS Accessibility, and draws a small floating label on each split.
 
-On macOS, Ghostty uses native macOS tabs. Native tabs are exposed as separate windows to lower-level window APIs, so this helper groups Ghostty's tab windows by frame and renders one label for the physical window.
+On macOS, Ghostty split panes are exposed in the Accessibility tree as terminal scroll areas. Lower-level window APIs only see native windows/tabs, so split-level labels require Accessibility permission for the helper.
 
 ## Run
 
@@ -13,11 +13,11 @@ cd ghostty-labels
 swift run ghostty-labels
 ```
 
-When Ghostty is the frontmost app, the helper shows a floating badge on each visible Ghostty window.
+When Ghostty is the frontmost app, the helper shows a floating badge on each visible Ghostty split pane.
 
-The selected Ghostty window gets a red badge. Other visible Ghostty windows get grey badges so overlapping labels are easier to scan. When you click a badge, macOS briefly focuses the helper, but the last selected Ghostty window stays red.
+The selected Ghostty split gets a red badge. Other visible Ghostty splits get grey badges so overlapping labels are easier to scan. When you click a badge, macOS briefly focuses the helper, but the last selected Ghostty split stays red.
 
-Click a badge to edit the overlay label for that visible window. The label is window-wise; switching Ghostty tabs should not create another badge or change the edited label.
+Click a badge to edit the overlay label for that visible split pane. The label is split-wise; switching Ghostty tabs should not create another badge or change the edited label.
 
 Stop it with `ctrl+c`.
 
@@ -37,12 +37,13 @@ By default labels only show while Ghostty is frontmost, so they do not cover oth
 ## Install Locally
 
 ```sh
-swift build -c release
-install -m 755 .build/release/ghostty-labels ~/.local/bin/ghostty-labels
+scripts/install-app.sh
 ```
 
-Run it in the background from any terminal:
+This builds `dist/Ghostty Labels.app`, installs a signed copy at `~/Applications/Ghostty Labels.app`, installs the LaunchAgent, and starts it.
 
-```sh
-ghostty-labels
-```
+After installing or rebuilding, macOS may require re-granting Accessibility permission to the freshly signed app:
+
+1. Open System Settings > Privacy & Security > Accessibility.
+2. Grant or toggle `Ghostty Labels` from `~/Applications`.
+3. Restart the LaunchAgent or rerun `scripts/install-app.sh`.
