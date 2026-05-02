@@ -83,6 +83,10 @@ private final class BadgeView: NSView {
     override func mouseDown(with event: NSEvent) {
         onClick?()
     }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
 }
 
 private final class LabelWindow: NSWindow {
@@ -232,6 +236,7 @@ private final class LabelController {
         alert.addButton(withTitle: "Use Tab Title")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = input
+        alert.window.level = .modalPanel
 
         input.selectText(nil)
         let response = alert.runModal()

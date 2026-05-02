@@ -13,7 +13,7 @@ swift run ghostty-labels
 
 Set a Ghostty tab title with `cmd+ctrl+l`. When Ghostty is the frontmost app, the helper shows that title as a floating badge on each visible Ghostty window.
 
-The active Ghostty window gets a red badge. Other visible Ghostty windows get grey badges so overlapping labels are easier to scan.
+The selected Ghostty window gets a red badge. Other visible Ghostty windows get grey badges so overlapping labels are easier to scan. When you click a badge, macOS briefly focuses the helper, but the last selected Ghostty window stays red.
 
 Click a badge to edit the overlay label for that visible window. Choose `Use Tab Title` to clear the custom overlay label and follow Ghostty's title again.
 
