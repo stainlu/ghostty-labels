@@ -9,15 +9,17 @@ private struct GhosttyWindow: Hashable {
 
 private typealias WindowGroupID = String
 
+private struct DetectedGhosttyWindowGroup {
+    let windowIDs: Set<CGWindowID>
+    let title: String
+    let bounds: CGRect
+}
+
 private struct GhosttyWindowGroup {
     let id: WindowGroupID
     let windowIDs: Set<CGWindowID>
     let title: String
     let bounds: CGRect
-
-    var representativeWindowID: CGWindowID {
-        windowIDs.min() ?? 0
-    }
 }
 
 private enum LabelPosition: String {
@@ -102,7 +104,7 @@ private final class BadgeView: NSView {
     }
 }
 
-private final class LabelWindow: NSWindow {
+private final class LabelWindow: NSPanel {
     let badgeView: BadgeView
     var groupID: WindowGroupID
     var onEdit: ((WindowGroupID, String) -> Void)?
@@ -113,12 +115,14 @@ private final class LabelWindow: NSWindow {
         self.badgeView = BadgeView(text: text)
         super.init(
             contentRect: frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
 
         isOpaque = false
+        isFloatingPanel = true
+        hidesOnDeactivate = false
         backgroundColor = .clear
         hasShadow = true
         ignoresMouseEvents = false
@@ -154,6 +158,9 @@ private final class LabelController {
     private var overlays: [WindowGroupID: LabelWindow] = [:]
     private var windowLabels: [WindowGroupID: String] = [:]
     private var windowIDToGroupID: [CGWindowID: WindowGroupID] = [:]
+    private var knownBoundsByGroupID: [WindowGroupID: CGRect] = [:]
+    private var knownWindowIDsByGroupID: [WindowGroupID: Set<CGWindowID>] = [:]
+    private var nextWindowGroupNumber = 1
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
     private var isEditing = false
@@ -185,7 +192,7 @@ private final class LabelController {
             return
         }
 
-        let groups = groupGhosttyWindows(visibleGhosttyWindows())
+        let groups = assignStableIDs(to: detectPhysicalWindows(visibleGhosttyWindows()))
         let liveIDs = Set(groups.map(\.id))
 
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
@@ -372,7 +379,64 @@ private final class LabelController {
             .activate(options: [.activateIgnoringOtherApps])
     }
 
-    private func groupGhosttyWindows(_ windows: [GhosttyWindow]) -> [GhosttyWindowGroup] {
+    private func assignStableIDs(to detectedGroups: [DetectedGhosttyWindowGroup]) -> [GhosttyWindowGroup] {
+        var usedIDs = Set<WindowGroupID>()
+        var groups: [GhosttyWindowGroup] = []
+
+        for detectedGroup in detectedGroups {
+            let groupID = bestExistingGroupID(for: detectedGroup, excluding: usedIDs) ?? newWindowGroupID()
+            usedIDs.insert(groupID)
+            groups.append(
+                GhosttyWindowGroup(
+                    id: groupID,
+                    windowIDs: detectedGroup.windowIDs,
+                    title: detectedGroup.title,
+                    bounds: detectedGroup.bounds
+                )
+            )
+        }
+
+        knownBoundsByGroupID = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.bounds) })
+        knownWindowIDsByGroupID = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.windowIDs) })
+        return groups
+    }
+
+    private func bestExistingGroupID(
+        for detectedGroup: DetectedGhosttyWindowGroup,
+        excluding usedIDs: Set<WindowGroupID>
+    ) -> WindowGroupID? {
+        var bestMatch: (id: WindowGroupID, score: CGFloat)?
+
+        for (groupID, previousBounds) in knownBoundsByGroupID where !usedIDs.contains(groupID) {
+            let previousWindowIDs = knownWindowIDsByGroupID[groupID] ?? []
+            let hasSharedWindowID = !previousWindowIDs.isDisjoint(with: detectedGroup.windowIDs)
+            let frameScore = samePhysicalWindow(previousBounds, detectedGroup.bounds)
+                ? CGFloat(250)
+                : intersectionOverUnion(previousBounds, detectedGroup.bounds) * 100
+            let idScore = hasSharedWindowID ? CGFloat(1000) : 0
+            let score = frameScore + idScore
+
+            if bestMatch == nil || score > bestMatch!.score {
+                bestMatch = (groupID, score)
+            }
+        }
+
+        guard let bestMatch, bestMatch.score >= 50 else {
+            return nil
+        }
+
+        return bestMatch.id
+    }
+
+    private func newWindowGroupID() -> WindowGroupID {
+        defer {
+            nextWindowGroupNumber += 1
+        }
+
+        return "window-\(nextWindowGroupNumber)"
+    }
+
+    private func detectPhysicalWindows(_ windows: [GhosttyWindow]) -> [DetectedGhosttyWindowGroup] {
         var groupedWindows: [[GhosttyWindow]] = []
 
         for window in windows {
@@ -391,13 +455,11 @@ private final class LabelController {
 
         return groupedWindows.map { group in
             let ids = Set(group.map(\.id))
-            let id = ids.sorted().map(String.init).joined(separator: "-")
             let bounds = group.reduce(group[0].bounds) { partial, window in
                 partial.union(window.bounds)
             }
 
-            return GhosttyWindowGroup(
-                id: id,
+            return DetectedGhosttyWindowGroup(
                 windowIDs: ids,
                 title: group[0].title,
                 bounds: bounds
@@ -410,6 +472,21 @@ private final class LabelController {
             abs(lhs.minY - rhs.minY) <= 8 &&
             abs(lhs.width - rhs.width) <= 16 &&
             abs(lhs.height - rhs.height) <= 16
+    }
+
+    private func intersectionOverUnion(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        guard !intersection.isNull, !intersection.isEmpty else {
+            return 0
+        }
+
+        let intersectionArea = intersection.width * intersection.height
+        let unionArea = lhs.width * lhs.height + rhs.width * rhs.height - intersectionArea
+        guard unionArea > 0 else {
+            return 0
+        }
+
+        return intersectionArea / unionArea
     }
 
     private func visibleGhosttyWindows() -> [GhosttyWindow] {
