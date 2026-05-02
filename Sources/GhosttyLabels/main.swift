@@ -93,6 +93,8 @@ private final class LabelController {
     private var overlays: [CGWindowID: LabelWindow] = [:]
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
+    private let activeLabelAlpha: CGFloat = 1
+    private let inactiveLabelAlpha: CGFloat = 0.35
     private var timer: Timer?
 
     func start() {
@@ -118,17 +120,30 @@ private final class LabelController {
             overlays.removeValue(forKey: staleID)
         }
 
+        // CGWindowListCopyWindowInfo returns windows front-to-back, so the first
+        // visible Ghostty window is the active one when Ghostty is focused.
+        let activeWindowID = isGhosttyFrontmost() ? windows.first?.id : nil
+
         for ghosttyWindow in windows {
             let frame = labelFrame(for: ghosttyWindow)
+            let isActiveWindow = ghosttyWindow.id == activeWindowID
             if let overlay = overlays[ghosttyWindow.id] {
                 overlay.badgeView.text = ghosttyWindow.title
+                overlay.alphaValue = isActiveWindow ? activeLabelAlpha : inactiveLabelAlpha
                 overlay.setFrame(frame, display: true)
-                overlay.orderFrontRegardless()
             } else {
                 let overlay = LabelWindow(text: ghosttyWindow.title, frame: frame)
+                overlay.alphaValue = isActiveWindow ? activeLabelAlpha : inactiveLabelAlpha
                 overlays[ghosttyWindow.id] = overlay
-                overlay.orderFrontRegardless()
             }
+        }
+
+        for ghosttyWindow in windows where ghosttyWindow.id != activeWindowID {
+            overlays[ghosttyWindow.id]?.orderFrontRegardless()
+        }
+
+        if let activeWindowID {
+            overlays[activeWindowID]?.orderFrontRegardless()
         }
     }
 

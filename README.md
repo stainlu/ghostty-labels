@@ -13,6 +13,8 @@ swift run ghostty-labels
 
 Set a Ghostty tab title with `cmd+ctrl+l`. When Ghostty is the frontmost app, the helper shows that title as a floating badge on each visible Ghostty window.
 
+The active Ghostty window gets a full-opacity badge. Other visible Ghostty windows are dimmed so overlapping labels are easier to scan.
+
 Stop it with `ctrl+c`.
 
 ## Options
