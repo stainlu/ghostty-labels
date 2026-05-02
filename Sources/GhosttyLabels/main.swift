@@ -19,7 +19,15 @@ private enum LabelPosition: String {
 }
 
 private final class BadgeView: NSView {
+    var onClick: (() -> Void)?
+
     var text: String {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    var isActive: Bool = true {
         didSet {
             needsDisplay = true
         }
@@ -41,10 +49,16 @@ private final class BadgeView: NSView {
 
         let bounds = self.bounds.insetBy(dx: 1, dy: 1)
         let path = NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8)
-        NSColor(calibratedRed: 1.0, green: 0.22, blue: 0.20, alpha: 0.94).setFill()
+        let fillColor = isActive
+            ? NSColor(calibratedRed: 1.0, green: 0.22, blue: 0.20, alpha: 0.96)
+            : NSColor(calibratedWhite: 0.34, alpha: 0.96)
+        fillColor.setFill()
         path.fill()
 
-        NSColor(calibratedWhite: 0.04, alpha: 0.75).setStroke()
+        let strokeColor = isActive
+            ? NSColor(calibratedWhite: 0.04, alpha: 0.75)
+            : NSColor(calibratedWhite: 0.12, alpha: 0.85)
+        strokeColor.setStroke()
         path.lineWidth = 1
         path.stroke()
 
@@ -65,12 +79,19 @@ private final class BadgeView: NSView {
             attributes: attributes
         )
     }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
 }
 
 private final class LabelWindow: NSWindow {
     let badgeView: BadgeView
+    var ghosttyWindowID: CGWindowID
+    var onEdit: ((CGWindowID, String) -> Void)?
 
-    init(text: String, frame: NSRect) {
+    init(windowID: CGWindowID, text: String, frame: NSRect) {
+        self.ghosttyWindowID = windowID
         self.badgeView = BadgeView(text: text)
         super.init(
             contentRect: frame,
@@ -82,19 +103,34 @@ private final class LabelWindow: NSWindow {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
-        ignoresMouseEvents = true
+        ignoresMouseEvents = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         level = .statusBar
+        badgeView.onClick = { [weak self] in
+            guard let self else {
+                return
+            }
+            self.onEdit?(self.ghosttyWindowID, self.badgeView.text)
+        }
         contentView = badgeView
+    }
+
+    override var canBecomeKey: Bool {
+        true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onEdit?(ghosttyWindowID, badgeView.text)
     }
 }
 
 private final class LabelController {
     private var overlays: [CGWindowID: LabelWindow] = [:]
+    private var customLabels: [CGWindowID: String] = [:]
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
-    private let activeLabelAlpha: CGFloat = 1
-    private let inactiveLabelAlpha: CGFloat = 0.35
+    private var isEditing = false
+    private var lastActiveWindowID: CGWindowID?
     private var timer: Timer?
 
     func start() {
@@ -107,7 +143,12 @@ private final class LabelController {
     }
 
     private func refresh() {
-        guard alwaysShow || isGhosttyFrontmost() else {
+        guard !isEditing else {
+            return
+        }
+
+        let ghosttyFrontmost = isGhosttyFrontmost()
+        guard alwaysShow || ghosttyFrontmost else {
             removeAllOverlays()
             return
         }
@@ -118,22 +159,33 @@ private final class LabelController {
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
             overlays[staleID]?.close()
             overlays.removeValue(forKey: staleID)
+            customLabels.removeValue(forKey: staleID)
         }
 
         // CGWindowListCopyWindowInfo returns windows front-to-back, so the first
         // visible Ghostty window is the active one when Ghostty is focused.
-        let activeWindowID = isGhosttyFrontmost() ? windows.first?.id : nil
+        if ghosttyFrontmost {
+            lastActiveWindowID = windows.first?.id
+        }
+        let activeWindowID = liveIDs.contains(lastActiveWindowID ?? 0) ? lastActiveWindowID : windows.first?.id
 
         for ghosttyWindow in windows {
-            let frame = labelFrame(for: ghosttyWindow)
+            let label = labelText(for: ghosttyWindow)
+            let frame = labelFrame(for: ghosttyWindow, label: label)
             let isActiveWindow = ghosttyWindow.id == activeWindowID
             if let overlay = overlays[ghosttyWindow.id] {
-                overlay.badgeView.text = ghosttyWindow.title
-                overlay.alphaValue = isActiveWindow ? activeLabelAlpha : inactiveLabelAlpha
+                overlay.ghosttyWindowID = ghosttyWindow.id
+                overlay.badgeView.text = label
+                overlay.badgeView.isActive = isActiveWindow
+                overlay.alphaValue = 1
                 overlay.setFrame(frame, display: true)
             } else {
-                let overlay = LabelWindow(text: ghosttyWindow.title, frame: frame)
-                overlay.alphaValue = isActiveWindow ? activeLabelAlpha : inactiveLabelAlpha
+                let overlay = LabelWindow(windowID: ghosttyWindow.id, text: label, frame: frame)
+                overlay.badgeView.isActive = isActiveWindow
+                overlay.alphaValue = 1
+                overlay.onEdit = { [weak self] windowID, currentLabel in
+                    self?.editLabel(for: windowID, currentLabel: currentLabel)
+                }
                 overlays[ghosttyWindow.id] = overlay
             }
         }
@@ -154,8 +206,62 @@ private final class LabelController {
         overlays.removeAll()
     }
 
+    private func labelText(for window: GhosttyWindow) -> String {
+        customLabels[window.id] ?? window.title
+    }
+
+    private func editLabel(for windowID: CGWindowID, currentLabel: String) {
+        isEditing = true
+        for overlay in overlays.values {
+            overlay.orderOut(nil)
+        }
+
+        defer {
+            isEditing = false
+            activateGhostty()
+            refresh()
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.stringValue = customLabels[windowID] ?? currentLabel
+
+        let alert = NSAlert()
+        alert.messageText = "Edit Ghostty Label"
+        alert.informativeText = "Leave blank or choose Use Tab Title to follow Ghostty's title again."
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Use Tab Title")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = input
+
+        input.selectText(nil)
+        let response = alert.runModal()
+
+        switch response {
+        case .alertFirstButtonReturn:
+            let label = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if label.isEmpty {
+                customLabels.removeValue(forKey: windowID)
+            } else {
+                customLabels[windowID] = label
+            }
+        case .alertSecondButtonReturn:
+            customLabels.removeValue(forKey: windowID)
+        default:
+            break
+        }
+    }
+
     private func isGhosttyFrontmost() -> Bool {
         NSWorkspace.shared.frontmostApplication?.localizedName == "Ghostty"
+    }
+
+    private func activateGhostty() {
+        NSWorkspace.shared.runningApplications
+            .first { $0.localizedName == "Ghostty" }?
+            .activate(options: [.activateIgnoringOtherApps])
     }
 
     private func visibleGhosttyWindows() -> [GhosttyWindow] {
@@ -188,8 +294,8 @@ private final class LabelController {
         }
     }
 
-    private func labelFrame(for window: GhosttyWindow) -> NSRect {
-        let size = badgeSize(for: window.title)
+    private func labelFrame(for window: GhosttyWindow, label: String) -> NSRect {
+        let size = badgeSize(for: label)
         let x: CGFloat
 
         switch position {
