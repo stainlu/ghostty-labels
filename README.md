@@ -2,7 +2,9 @@
 
 A tiny macOS overlay helper for Ghostty.
 
-Ghostty does not currently expose a plugin API for custom titlebar/window UI. This helper runs beside Ghostty, watches visible Ghostty windows, and draws a small floating label on each window using the window/tab title.
+Ghostty does not currently expose a plugin API for custom titlebar/window UI. This helper runs beside Ghostty, watches visible Ghostty windows, and draws a small floating label on each physical Ghostty window.
+
+On macOS, Ghostty uses native macOS tabs. Native tabs are exposed as separate windows to lower-level window APIs, so this helper groups Ghostty's tab windows by frame and renders one label for the physical window.
 
 ## Run
 
@@ -11,11 +13,11 @@ cd ghostty-labels
 swift run ghostty-labels
 ```
 
-Set a Ghostty tab title with `cmd+ctrl+l`. When Ghostty is the frontmost app, the helper shows that title as a floating badge on each visible Ghostty window.
+When Ghostty is the frontmost app, the helper shows a floating badge on each visible Ghostty window.
 
 The selected Ghostty window gets a red badge. Other visible Ghostty windows get grey badges so overlapping labels are easier to scan. When you click a badge, macOS briefly focuses the helper, but the last selected Ghostty window stays red.
 
-Click a badge to edit the overlay label for that visible window. Choose `Use Tab Title` to clear the custom overlay label and follow Ghostty's title again.
+Click a badge to edit the overlay label for that visible window. The label is window-wise; switching Ghostty tabs should not create another badge or change the edited label.
 
 Stop it with `ctrl+c`.
 

@@ -7,6 +7,19 @@ private struct GhosttyWindow: Hashable {
     let bounds: CGRect
 }
 
+private typealias WindowGroupID = String
+
+private struct GhosttyWindowGroup {
+    let id: WindowGroupID
+    let windowIDs: Set<CGWindowID>
+    let title: String
+    let bounds: CGRect
+
+    var representativeWindowID: CGWindowID {
+        windowIDs.min() ?? 0
+    }
+}
+
 private enum LabelPosition: String {
     case topLeft = "top-left"
     case topCenter = "top-center"
@@ -91,12 +104,12 @@ private final class BadgeView: NSView {
 
 private final class LabelWindow: NSWindow {
     let badgeView: BadgeView
-    var ghosttyWindowID: CGWindowID
-    var onEdit: ((CGWindowID, String) -> Void)?
+    var groupID: WindowGroupID
+    var onEdit: ((WindowGroupID, String) -> Void)?
     var onMouseDown: ((NSPoint) -> Void)?
 
-    init(windowID: CGWindowID, text: String, frame: NSRect) {
-        self.ghosttyWindowID = windowID
+    init(groupID: WindowGroupID, text: String, frame: NSRect) {
+        self.groupID = groupID
         self.badgeView = BadgeView(text: text)
         super.init(
             contentRect: frame,
@@ -115,7 +128,7 @@ private final class LabelWindow: NSWindow {
             guard let self else {
                 return
             }
-            self.onEdit?(self.ghosttyWindowID, self.badgeView.text)
+            self.onEdit?(self.groupID, self.badgeView.text)
         }
         contentView = badgeView
     }
@@ -125,7 +138,7 @@ private final class LabelWindow: NSWindow {
     }
 
     override func mouseDown(with event: NSEvent) {
-        onEdit?(ghosttyWindowID, badgeView.text)
+        onEdit?(groupID, badgeView.text)
     }
 
     override func sendEvent(_ event: NSEvent) {
@@ -138,12 +151,14 @@ private final class LabelWindow: NSWindow {
 }
 
 private final class LabelController {
-    private var overlays: [CGWindowID: LabelWindow] = [:]
-    private var customLabels: [CGWindowID: String] = [:]
+    private var overlays: [WindowGroupID: LabelWindow] = [:]
+    private var windowLabels: [WindowGroupID: String] = [:]
+    private var windowIDToGroupID: [CGWindowID: WindowGroupID] = [:]
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
     private var isEditing = false
-    private var lastActiveWindowID: CGWindowID?
+    private var pendingEditGroupID: WindowGroupID?
+    private var lastActiveGroupID: WindowGroupID?
     private var timer: Timer?
     private var eventMonitorTokens: [Any] = []
 
@@ -170,52 +185,57 @@ private final class LabelController {
             return
         }
 
-        let windows = visibleGhosttyWindows()
-        let liveIDs = Set(windows.map(\.id))
+        let groups = groupGhosttyWindows(visibleGhosttyWindows())
+        let liveIDs = Set(groups.map(\.id))
 
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
             overlays[staleID]?.close()
             overlays.removeValue(forKey: staleID)
-            customLabels.removeValue(forKey: staleID)
+            windowLabels.removeValue(forKey: staleID)
         }
 
-        // CGWindowListCopyWindowInfo returns windows front-to-back, so the first
-        // visible Ghostty window is the active one when Ghostty is focused.
+        // CGWindowListCopyWindowInfo returns windows front-to-back. Ghostty uses
+        // native macOS tabs, so multiple tab "windows" can share one frame; after
+        // grouping, the first group is the selected physical Ghostty window.
         if ghosttyFrontmost {
-            lastActiveWindowID = windows.first?.id
+            lastActiveGroupID = groups.first?.id
         }
-        let activeWindowID = liveIDs.contains(lastActiveWindowID ?? 0) ? lastActiveWindowID : windows.first?.id
+        let activeGroupID = liveIDs.contains(lastActiveGroupID ?? "") ? lastActiveGroupID : groups.first?.id
 
-        for ghosttyWindow in windows {
-            let label = labelText(for: ghosttyWindow)
-            let frame = labelFrame(for: ghosttyWindow, label: label)
-            let isActiveWindow = ghosttyWindow.id == activeWindowID
-            if let overlay = overlays[ghosttyWindow.id] {
-                overlay.ghosttyWindowID = ghosttyWindow.id
+        var nextWindowIDToGroupID: [CGWindowID: WindowGroupID] = [:]
+        for group in groups {
+            let label = labelText(for: group)
+            let frame = labelFrame(for: group, label: label)
+            let isActiveWindow = group.id == activeGroupID
+            group.windowIDs.forEach { nextWindowIDToGroupID[$0] = group.id }
+
+            if let overlay = overlays[group.id] {
+                overlay.groupID = group.id
                 overlay.badgeView.text = label
                 overlay.badgeView.isActive = isActiveWindow
                 overlay.alphaValue = 1
                 overlay.setFrame(frame, display: true)
             } else {
-                let overlay = LabelWindow(windowID: ghosttyWindow.id, text: label, frame: frame)
+                let overlay = LabelWindow(groupID: group.id, text: label, frame: frame)
                 overlay.badgeView.isActive = isActiveWindow
                 overlay.alphaValue = 1
-                overlay.onEdit = { [weak self] windowID, currentLabel in
-                    self?.editLabel(for: windowID, currentLabel: currentLabel)
+                overlay.onEdit = { [weak self] groupID, currentLabel in
+                    self?.scheduleEditLabel(for: groupID, currentLabel: currentLabel)
                 }
                 overlay.onMouseDown = { [weak self] point in
                     _ = self?.editLabelIfNeeded(at: point)
                 }
-                overlays[ghosttyWindow.id] = overlay
+                overlays[group.id] = overlay
             }
         }
+        windowIDToGroupID = nextWindowIDToGroupID
 
-        for ghosttyWindow in windows where ghosttyWindow.id != activeWindowID {
-            overlays[ghosttyWindow.id]?.orderFrontRegardless()
+        for group in groups where group.id != activeGroupID {
+            overlays[group.id]?.orderFrontRegardless()
         }
 
-        if let activeWindowID {
-            overlays[activeWindowID]?.orderFrontRegardless()
+        if let activeGroupID {
+            overlays[activeGroupID]?.orderFrontRegardless()
         }
     }
 
@@ -226,8 +246,21 @@ private final class LabelController {
         overlays.removeAll()
     }
 
-    private func labelText(for window: GhosttyWindow) -> String {
-        customLabels[window.id] ?? window.title
+    private func labelText(for group: GhosttyWindowGroup) -> String {
+        if let label = windowLabels[group.id] {
+            return label
+        }
+
+        for windowID in group.windowIDs {
+            if let previousGroupID = windowIDToGroupID[windowID],
+               let previousLabel = windowLabels[previousGroupID] {
+                windowLabels[group.id] = previousLabel
+                return previousLabel
+            }
+        }
+
+        windowLabels[group.id] = group.title
+        return group.title
     }
 
     private func installEventMonitors() {
@@ -251,7 +284,7 @@ private final class LabelController {
     }
 
     private func editLabelIfNeeded(at point: NSPoint) -> Bool {
-        guard !isEditing else {
+        guard !isEditing, pendingEditGroupID == nil else {
             return true
         }
 
@@ -263,12 +296,28 @@ private final class LabelController {
             return false
         }
 
-        let target = candidates.first { $0.ghosttyWindowID == lastActiveWindowID } ?? candidates[0]
-        editLabel(for: target.ghosttyWindowID, currentLabel: target.badgeView.text)
+        let target = candidates.first { $0.groupID == lastActiveGroupID } ?? candidates[0]
+        scheduleEditLabel(for: target.groupID, currentLabel: target.badgeView.text)
         return true
     }
 
-    private func editLabel(for windowID: CGWindowID, currentLabel: String) {
+    private func scheduleEditLabel(for groupID: WindowGroupID, currentLabel: String) {
+        guard pendingEditGroupID == nil, !isEditing else {
+            return
+        }
+
+        pendingEditGroupID = groupID
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.pendingEditGroupID = nil
+            self.editLabel(for: groupID, currentLabel: currentLabel)
+        }
+    }
+
+    private func editLabel(for groupID: WindowGroupID, currentLabel: String) {
         isEditing = true
         defer {
             isEditing = false
@@ -279,14 +328,14 @@ private final class LabelController {
         NSApp.activate(ignoringOtherApps: true)
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        input.stringValue = customLabels[windowID] ?? currentLabel
+        input.stringValue = windowLabels[groupID] ?? currentLabel
 
         let alert = NSAlert()
         alert.messageText = "Edit Ghostty Label"
-        alert.informativeText = "Leave blank or choose Use Tab Title to follow Ghostty's title again."
+        alert.informativeText = "This label belongs to the Ghostty window, not the selected tab."
         alert.accessoryView = input
         alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Use Tab Title")
+        alert.addButton(withTitle: "Reset")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = input
         alert.window.level = .modalPanel
@@ -298,12 +347,12 @@ private final class LabelController {
         case .alertFirstButtonReturn:
             let label = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if label.isEmpty {
-                customLabels.removeValue(forKey: windowID)
+                windowLabels[groupID] = "Ghostty"
             } else {
-                customLabels[windowID] = label
+                windowLabels[groupID] = label
             }
         case .alertSecondButtonReturn:
-            customLabels.removeValue(forKey: windowID)
+            windowLabels[groupID] = "Ghostty"
         default:
             break
         }
@@ -321,6 +370,46 @@ private final class LabelController {
         NSWorkspace.shared.runningApplications
             .first { $0.localizedName == "Ghostty" }?
             .activate(options: [.activateIgnoringOtherApps])
+    }
+
+    private func groupGhosttyWindows(_ windows: [GhosttyWindow]) -> [GhosttyWindowGroup] {
+        var groupedWindows: [[GhosttyWindow]] = []
+
+        for window in windows {
+            if let index = groupedWindows.firstIndex(where: { existingGroup in
+                guard let first = existingGroup.first else {
+                    return false
+                }
+
+                return samePhysicalWindow(first.bounds, window.bounds)
+            }) {
+                groupedWindows[index].append(window)
+            } else {
+                groupedWindows.append([window])
+            }
+        }
+
+        return groupedWindows.map { group in
+            let ids = Set(group.map(\.id))
+            let id = ids.sorted().map(String.init).joined(separator: "-")
+            let bounds = group.reduce(group[0].bounds) { partial, window in
+                partial.union(window.bounds)
+            }
+
+            return GhosttyWindowGroup(
+                id: id,
+                windowIDs: ids,
+                title: group[0].title,
+                bounds: bounds
+            )
+        }
+    }
+
+    private func samePhysicalWindow(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 8 &&
+            abs(lhs.minY - rhs.minY) <= 8 &&
+            abs(lhs.width - rhs.width) <= 16 &&
+            abs(lhs.height - rhs.height) <= 16
     }
 
     private func visibleGhosttyWindows() -> [GhosttyWindow] {
@@ -353,7 +442,7 @@ private final class LabelController {
         }
     }
 
-    private func labelFrame(for window: GhosttyWindow, label: String) -> NSRect {
+    private func labelFrame(for window: GhosttyWindowGroup, label: String) -> NSRect {
         let size = badgeSize(for: label)
         let x: CGFloat
 
