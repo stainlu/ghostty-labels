@@ -235,7 +235,6 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
             }
 
             self.focusEditor()
-            field.selectText(nil)
         }
     }
 
@@ -249,7 +248,10 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
         orderFrontRegardless()
         let accepted = makeFirstResponder(editField)
         log("ghostty-labels: edit focus split=\(splitID) accepted=\(accepted)")
-        editField.currentEditor()?.selectAll(nil)
+        editField.currentEditor()?.selectedRange = NSRange(
+            location: (editField.stringValue as NSString).length,
+            length: 0
+        )
     }
 
     func finishEditingAndSave() {
@@ -339,6 +341,10 @@ private final class LabelController {
     }
 
     private func refresh() {
+        guard !isEditing else {
+            return
+        }
+
         if AXIsProcessTrusted(), eventTap == nil {
             installEventTap()
         }
@@ -570,7 +576,6 @@ private final class LabelController {
             }
 
             self.editingSplitID = nil
-            self.activateGhostty()
             self.refresh()
         }
     }
