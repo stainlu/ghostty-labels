@@ -13,6 +13,7 @@ private struct GhosttyWindow {
 private struct ActiveGhosttyWindow {
     let title: String
     let persistenceName: String
+    let legacyPersistenceNames: [String]
     let bounds: CGRect
     let axWindow: AXUIElement
 }
@@ -21,6 +22,7 @@ private struct DetectedSplit {
     let title: String
     let windowTitle: String
     let windowPersistenceName: String
+    let windowLegacyPersistenceNames: [String]
     let bounds: CGRect
     let windowBounds: CGRect
     let isFocused: Bool
@@ -186,7 +188,7 @@ private final class LabelWindow: NSPanel {
         hasShadow = true
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         level = .statusBar
         badgeView.onClick = { [weak self] in
             guard let self else { return }
@@ -779,17 +781,30 @@ private final class LabelController {
         )
         let visibleTitle = visibleWindow.map { normalizedTitle($0.title) } ?? ""
         let title = firstMeaningfulTitle(focusedTitle, visibleTitle) ?? "Ghostty"
-        let persistenceName = persistenceWindowName(
+        var persistenceName = persistenceWindowName(
             forTitle: title,
             visibleWindow: visibleWindow,
             visibleWindows: visibleWindows,
             app: app,
             frame: focusedFrame
         )
+        var legacyPersistenceNames: [String] = []
+        if let previousWindow = lastActiveGhosttyWindow,
+           sameAXElement(previousWindow.axWindow, focusedWindow) {
+            if visibleWindow == nil {
+                legacyPersistenceNames.append(persistenceName)
+                persistenceName = previousWindow.persistenceName
+            } else if previousWindow.persistenceName != persistenceName {
+                legacyPersistenceNames.append(previousWindow.persistenceName)
+            }
+            legacyPersistenceNames.append(contentsOf: previousWindow.legacyPersistenceNames)
+        }
+        legacyPersistenceNames = uniqueStrings(legacyPersistenceNames.filter { $0 != persistenceName })
 
         return ActiveGhosttyWindow(
             title: title,
             persistenceName: persistenceName,
+            legacyPersistenceNames: legacyPersistenceNames,
             bounds: focusedFrame,
             axWindow: focusedWindow
         )
@@ -816,6 +831,7 @@ private final class LabelController {
                 title: "Ghostty",
                 windowTitle: activeWindow.title,
                 windowPersistenceName: activeWindow.persistenceName,
+                windowLegacyPersistenceNames: activeWindow.legacyPersistenceNames,
                 bounds: frame,
                 windowBounds: activeWindow.bounds,
                 isFocused: focusedFrame.map { samePhysicalWindow($0, frame) || intersectionOverUnion($0, frame) > 0.8 } ?? false
@@ -879,8 +895,11 @@ private final class LabelController {
     }
 
     private func legacyPersistenceKeys(for split: DetectedSplit) -> [String] {
-        let aliases = titleAliasesByWindowName[split.windowPersistenceName] ?? []
-        return aliases
+        let windowNames = [split.windowPersistenceName] + split.windowLegacyPersistenceNames
+        let aliases = windowNames.flatMap { titleAliasesByWindowName[$0] ?? [] }
+        let legacyWindowNames = split.windowLegacyPersistenceNames + aliases
+
+        return uniqueStrings(legacyWindowNames)
             .filter { !$0.isEmpty && $0 != split.windowPersistenceName }
             .map { persistenceKey(for: split, windowName: $0) }
     }
@@ -941,7 +960,12 @@ private final class LabelController {
             return "window:\(app.processIdentifier):\(visibleWindow.id)"
         }
 
-        return "window:\(app.processIdentifier):\(rounded(frame.minX)):\(rounded(frame.minY)):\(rounded(frame.width)):\(rounded(frame.height))"
+        let normalized = normalizedTitle(title)
+        if !normalized.isEmpty, normalized != "Ghostty" {
+            return "title:\(normalized)"
+        }
+
+        return "window:\(app.processIdentifier):unmatched"
     }
 
     private func rememberWindowTitle(_ window: ActiveGhosttyWindow) {
@@ -951,6 +975,9 @@ private final class LabelController {
         }
 
         titleAliasesByWindowName[window.persistenceName, default: []].insert(title)
+        for legacyName in window.legacyPersistenceNames {
+            titleAliasesByWindowName[legacyName, default: []].insert(title)
+        }
     }
 
     private func bestExistingSplitID(for detectedSplit: DetectedSplit, excluding usedIDs: Set<SplitID>) -> SplitID? {
@@ -1051,18 +1078,23 @@ private final class LabelController {
 
     private func labelFrame(forSplitBounds splitBounds: CGRect, label: String) -> NSRect {
         let size = badgeSize(for: label)
+        let splitTopLeft = appKitPoint(fromQuartzPoint: CGPoint(x: splitBounds.minX, y: splitBounds.minY))
+        let splitTopRight = appKitPoint(fromQuartzPoint: CGPoint(x: splitBounds.maxX, y: splitBounds.minY))
+        let splitLeft = min(splitTopLeft.x, splitTopRight.x)
+        let splitRight = max(splitTopLeft.x, splitTopRight.x)
+        let splitMidX = splitLeft + (splitRight - splitLeft) / 2
         let x: CGFloat
 
         switch position {
         case .topLeft:
-            x = splitBounds.minX + 18
+            x = splitLeft + 18
         case .topCenter:
-            x = splitBounds.midX - size.width / 2
+            x = splitMidX - size.width / 2
         case .topRight:
-            x = splitBounds.maxX - size.width - 18
+            x = splitRight - size.width - 18
         }
 
-        let y = appKitY(forTopEdgeOf: splitBounds) - size.height - 12
+        let y = splitTopLeft.y - size.height - 12
         return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
 
@@ -1074,47 +1106,46 @@ private final class LabelController {
         return NSSize(width: min(max(measured.width + 32, 86), 360), height: 30)
     }
 
-    private func appKitY(forTopEdgeOf cgBounds: CGRect) -> CGFloat {
-        let display = NSScreen.screens.first { screen in
-            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
-                return false
-            }
-            let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
-            return displayBounds.intersects(cgBounds)
-        }
-
-        guard
-            let screen = display,
-            let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-        else {
-            let maxY = NSScreen.screens.map(\.frame.maxY).max() ?? 0
-            return maxY - cgBounds.minY
-        }
-
-        let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
-        let distanceFromDisplayTop = cgBounds.minY - displayBounds.minY
-        return screen.frame.maxY - distanceFromDisplayTop
-    }
-
     private func appKitPoint(fromQuartzPoint point: CGPoint) -> NSPoint {
-        for screen in NSScreen.screens {
-            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
-                continue
-            }
-
-            let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
-            guard displayBounds.contains(point) else {
-                continue
-            }
-
+        if let display = displayContainingQuartzPoint(point) {
             return NSPoint(
-                x: screen.frame.minX + point.x - displayBounds.minX,
-                y: screen.frame.maxY - (point.y - displayBounds.minY)
+                x: display.screen.frame.minX + point.x - display.bounds.minX,
+                y: display.screen.frame.maxY - (point.y - display.bounds.minY)
             )
         }
 
         let maxY = NSScreen.screens.map(\.frame.maxY).max() ?? 0
         return NSPoint(x: point.x, y: maxY - point.y)
+    }
+
+    private func displayContainingQuartzPoint(_ point: CGPoint) -> (screen: NSScreen, bounds: CGRect)? {
+        let displays = screenDisplayPairs()
+        if let display = displays.first(where: { $0.bounds.contains(point) }) {
+            return display
+        }
+
+        return displays.min {
+            distanceSquared(from: point, to: $0.bounds) < distanceSquared(from: point, to: $1.bounds)
+        }
+    }
+
+    private func screenDisplayPairs() -> [(screen: NSScreen, bounds: CGRect)] {
+        NSScreen.screens.compactMap { screen in
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return nil
+            }
+
+            let bounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
+            return (screen: screen, bounds: bounds)
+        }
+    }
+
+    private func distanceSquared(from point: CGPoint, to rect: CGRect) -> CGFloat {
+        let clampedX = min(max(point.x, rect.minX), rect.maxX)
+        let clampedY = min(max(point.y, rect.minY), rect.maxY)
+        let dx = point.x - clampedX
+        let dy = point.y - clampedY
+        return dx * dx + dy * dy
     }
 }
 
@@ -1184,6 +1215,22 @@ private func uniqueFrames(_ frames: [CGRect]) -> [CGRect] {
     }
 
     return result
+}
+
+private func uniqueStrings(_ strings: [String]) -> [String] {
+    var seen = Set<String>()
+    var result: [String] = []
+
+    for string in strings where !seen.contains(string) {
+        seen.insert(string)
+        result.append(string)
+    }
+
+    return result
+}
+
+private func sameAXElement(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
+    CFEqual(lhs, rhs)
 }
 
 private func samePhysicalWindow(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
