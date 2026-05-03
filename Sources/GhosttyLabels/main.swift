@@ -101,6 +101,10 @@ private final class BadgeView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
     }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
 }
 
 private enum LabelEditResult {
@@ -134,7 +138,7 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
         self.badgeView = BadgeView(text: text)
         super.init(
             contentRect: frame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
@@ -145,10 +149,12 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
         backgroundColor = .clear
         hasShadow = true
         ignoresMouseEvents = false
+        acceptsMouseMovedEvents = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         level = .statusBar
         badgeView.onClick = { [weak self] in
             guard let self else { return }
+            log("ghostty-labels: badge mouseDown split=\(self.splitID)")
             self.onEdit?(self.splitID, self.badgeView.text)
         }
         contentView = badgeView
@@ -267,13 +273,17 @@ private final class LabelController {
     private var lastActiveSplitID: SplitID?
     private var timer: Timer?
     private var eventMonitorTokens: [Any] = []
+    private var eventTap: CFMachPort?
+    private var eventTapRunLoopSource: CFRunLoopSource?
     private var warnedAboutAccessibility = false
     private var lastReportedSplitCount: Int?
     private var lastAXWindowErrorLogTime = Date.distantPast
 
     func start() {
         installEventMonitors()
-        _ = hasAccessibilityPermission()
+        if hasAccessibilityPermission() {
+            installEventTap()
+        }
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -287,6 +297,10 @@ private final class LabelController {
     private func refresh() {
         guard !isEditing else {
             return
+        }
+
+        if AXIsProcessTrusted(), eventTap == nil {
+            installEventTap()
         }
 
         let ghosttyFrontmost = isGhosttyFrontmost()
@@ -385,6 +399,50 @@ private final class LabelController {
         }
     }
 
+    private func installEventTap() {
+        guard eventTap == nil else {
+            return
+        }
+
+        let eventMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: eventMask,
+            callback: { _, type, event, refcon in
+                guard type == .leftMouseDown, let refcon else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                let controller = Unmanaged<LabelController>.fromOpaque(refcon).takeUnretainedValue()
+                let quartzPoint = event.location
+                DispatchQueue.main.async {
+                    let point = controller.appKitPoint(fromQuartzPoint: quartzPoint)
+                    _ = controller.editLabelIfNeeded(at: point)
+                }
+
+                return Unmanaged.passUnretained(event)
+            },
+            userInfo: refcon
+        ) else {
+            log("ghostty-labels: failed to install mouse event tap")
+            return
+        }
+
+        guard let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            log("ghostty-labels: failed to create mouse event tap run loop source")
+            return
+        }
+
+        eventTap = tap
+        eventTapRunLoopSource = runLoopSource
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        log("ghostty-labels: mouse event tap installed")
+    }
+
     private func editLabelIfNeeded(at point: NSPoint) -> Bool {
         guard !isEditing, pendingEditSplitID == nil else {
             return false
@@ -399,6 +457,7 @@ private final class LabelController {
         }
 
         let target = candidates.first { $0.splitID == lastActiveSplitID } ?? candidates[0]
+        log("ghostty-labels: label click at \(Int(point.x)),\(Int(point.y)) split=\(target.splitID)")
         scheduleEditLabel(for: target.splitID, currentLabel: target.badgeView.text)
         return true
     }
@@ -674,6 +733,27 @@ private final class LabelController {
         let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
         let distanceFromDisplayTop = cgBounds.minY - displayBounds.minY
         return screen.frame.maxY - distanceFromDisplayTop
+    }
+
+    private func appKitPoint(fromQuartzPoint point: CGPoint) -> NSPoint {
+        for screen in NSScreen.screens {
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                continue
+            }
+
+            let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
+            guard displayBounds.contains(point) else {
+                continue
+            }
+
+            return NSPoint(
+                x: screen.frame.minX + point.x - displayBounds.minX,
+                y: screen.frame.maxY - (point.y - displayBounds.minY)
+            )
+        }
+
+        let maxY = NSScreen.screens.map(\.frame.maxY).max() ?? 0
+        return NSPoint(x: point.x, y: maxY - point.y)
     }
 }
 
