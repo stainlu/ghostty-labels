@@ -47,6 +47,10 @@ private final class BadgeView: NSView {
         didSet { needsDisplay = true }
     }
 
+    var isClickable: Bool = true {
+        didSet { window?.invalidateCursorRects(for: self) }
+    }
+
     init(text: String) {
         self.text = text
         super.init(frame: .zero)
@@ -103,7 +107,9 @@ private final class BadgeView: NSView {
     }
 
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
+        if isClickable {
+            addCursorRect(bounds, cursor: .pointingHand)
+        }
     }
 }
 
@@ -128,10 +134,15 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
     let badgeView: BadgeView
     var splitID: SplitID
     var onEdit: ((SplitID, String) -> Void)?
+    var onLiveEdit: ((SplitID, String) -> Void)?
     var onMouseDown: ((NSPoint) -> Void)?
     private var editField: LabelEditField?
     private var editCompletion: ((LabelEditResult) -> Void)?
     private var isFinishingEdit = false
+
+    var isEditing: Bool {
+        editField != nil
+    }
 
     init(splitID: SplitID, text: String, frame: NSRect) {
         self.splitID = splitID
@@ -181,7 +192,8 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
     }
 
     func beginEditing(currentText: String, onComplete: @escaping (LabelEditResult) -> Void) {
-        guard editField == nil else {
+        if editField != nil {
+            focusEditor()
             return
         }
 
@@ -193,13 +205,15 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
         field.lineBreakMode = NSLineBreakMode.byTruncatingTail
         field.isEditable = true
         field.isSelectable = true
-        field.isBordered = true
-        field.isBezeled = true
-        field.bezelStyle = NSTextField.BezelStyle.roundedBezel
+        field.isBordered = false
+        field.isBezeled = false
         field.drawsBackground = true
-        field.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1)
+        field.backgroundColor = NSColor(calibratedRed: 1.0, green: 0.22, blue: 0.20, alpha: 0.98)
         field.textColor = NSColor.white
-        field.focusRingType = NSFocusRingType.default
+        field.focusRingType = NSFocusRingType.none
+        field.wantsLayer = true
+        field.layer?.cornerRadius = 8
+        field.layer?.masksToBounds = true
         field.delegate = self
         field.target = self
         field.action = #selector(commitEditing)
@@ -211,17 +225,35 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
         editField = field
         editCompletion = onComplete
         contentView = field
-        makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        orderFrontRegardless()
 
         DispatchQueue.main.async { [weak self, weak field] in
             guard let self, let field, self.editField === field else {
                 return
             }
 
-            self.makeFirstResponder(field)
-            field.currentEditor()?.selectAll(nil)
+            self.focusEditor()
+            field.selectText(nil)
         }
+    }
+
+    func focusEditor() {
+        guard let editField else {
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        orderFrontRegardless()
+        let accepted = makeFirstResponder(editField)
+        log("ghostty-labels: edit focus split=\(splitID) accepted=\(accepted)")
+        editField.currentEditor()?.selectAll(nil)
+    }
+
+    func finishEditingAndSave() {
+        commitEditing()
     }
 
     @objc private func commitEditing() {
@@ -242,6 +274,14 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
         }
 
         commitEditing()
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = editField else {
+            return
+        }
+
+        onLiveEdit?(splitID, field.stringValue)
     }
 
     private func finishEditing(_ result: LabelEditResult) {
@@ -268,7 +308,7 @@ private final class LabelController {
     private var nextSplitNumber = 1
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
-    private var isEditing = false
+    private var editingSplitID: SplitID?
     private var pendingEditSplitID: SplitID?
     private var lastActiveSplitID: SplitID?
     private var timer: Timer?
@@ -278,6 +318,10 @@ private final class LabelController {
     private var warnedAboutAccessibility = false
     private var lastReportedSplitCount: Int?
     private var lastAXWindowErrorLogTime = Date.distantPast
+
+    private var isEditing: Bool {
+        editingSplitID != nil
+    }
 
     func start() {
         installEventMonitors()
@@ -295,10 +339,6 @@ private final class LabelController {
     }
 
     private func refresh() {
-        guard !isEditing else {
-            return
-        }
-
         if AXIsProcessTrusted(), eventTap == nil {
             installEventTap()
         }
@@ -322,6 +362,9 @@ private final class LabelController {
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
             overlays[staleID]?.close()
             overlays.removeValue(forKey: staleID)
+            if editingSplitID == staleID {
+                editingSplitID = nil
+            }
         }
 
         if ghosttyFrontmost {
@@ -333,22 +376,32 @@ private final class LabelController {
             let label = labelText(for: split)
             let frame = labelFrame(for: split, label: label)
             let isActive = split.id == activeSplitID
+            let acceptsMouse = split.id == activeSplitID
 
             if let overlay = overlays[split.id] {
                 overlay.splitID = split.id
-                overlay.badgeView.text = label
+                if !overlay.isEditing {
+                    overlay.badgeView.text = label
+                }
                 overlay.badgeView.isActive = isActive
+                overlay.badgeView.isClickable = acceptsMouse
                 overlay.alphaValue = 1
+                overlay.ignoresMouseEvents = !acceptsMouse
                 overlay.setFrame(frame, display: true)
             } else {
                 let overlay = LabelWindow(splitID: split.id, text: label, frame: frame)
                 overlay.badgeView.isActive = isActive
+                overlay.badgeView.isClickable = acceptsMouse
                 overlay.alphaValue = 1
+                overlay.ignoresMouseEvents = !acceptsMouse
                 overlay.onEdit = { [weak self] splitID, currentLabel in
-                    self?.scheduleEditLabel(for: splitID, currentLabel: currentLabel)
+                    self?.editActiveLabelIfNeeded(splitID: splitID, currentLabel: currentLabel)
+                }
+                overlay.onLiveEdit = { [weak self] splitID, rawLabel in
+                    self?.saveLabel(rawLabel, for: splitID)
                 }
                 overlay.onMouseDown = { [weak self] point in
-                    _ = self?.editLabelIfNeeded(at: point)
+                    _ = self?.handleLabelClick(at: point)
                 }
                 overlays[split.id] = overlay
             }
@@ -382,7 +435,7 @@ private final class LabelController {
     private func installEventMonitors() {
         eventMonitorTokens.append(
             NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-                if self?.editLabelIfNeeded(at: NSEvent.mouseLocation) == true {
+                if self?.handleLabelClick(at: NSEvent.mouseLocation) == true {
                     return nil
                 }
 
@@ -392,7 +445,7 @@ private final class LabelController {
 
         if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown, handler: { [weak self] _ in
             DispatchQueue.main.async {
-                _ = self?.editLabelIfNeeded(at: NSEvent.mouseLocation)
+                _ = self?.handleLabelClick(at: NSEvent.mouseLocation)
             }
         }) {
             eventMonitorTokens.append(globalMonitor)
@@ -409,7 +462,7 @@ private final class LabelController {
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,
+            options: .defaultTap,
             eventsOfInterest: eventMask,
             callback: { _, type, event, refcon in
                 guard type == .leftMouseDown, let refcon else {
@@ -418,9 +471,9 @@ private final class LabelController {
 
                 let controller = Unmanaged<LabelController>.fromOpaque(refcon).takeUnretainedValue()
                 let quartzPoint = event.location
-                DispatchQueue.main.async {
-                    let point = controller.appKitPoint(fromQuartzPoint: quartzPoint)
-                    _ = controller.editLabelIfNeeded(at: point)
+                let point = controller.appKitPoint(fromQuartzPoint: quartzPoint)
+                if controller.handleLabelClick(at: point) {
+                    return nil
                 }
 
                 return Unmanaged.passUnretained(event)
@@ -443,27 +496,45 @@ private final class LabelController {
         log("ghostty-labels: mouse event tap installed")
     }
 
-    private func editLabelIfNeeded(at point: NSPoint) -> Bool {
-        guard !isEditing, pendingEditSplitID == nil else {
+    private func handleLabelClick(at point: NSPoint) -> Bool {
+        if let editingSplitID, let editingOverlay = overlays[editingSplitID] {
+            if editingOverlay.frame.contains(point) {
+                editingOverlay.focusEditor()
+                return true
+            }
+
+            editingOverlay.finishEditingAndSave()
             return false
         }
 
-        let candidates = overlays.values.filter { overlay in
-            overlay.isVisible && overlay.frame.contains(point)
-        }
-
-        guard !candidates.isEmpty else {
+        guard pendingEditSplitID == nil,
+              let activeSplitID = lastActiveSplitID,
+              let activeOverlay = overlays[activeSplitID],
+              activeOverlay.isVisible,
+              activeOverlay.frame.contains(point)
+        else {
             return false
         }
 
-        let target = candidates.first { $0.splitID == lastActiveSplitID } ?? candidates[0]
-        log("ghostty-labels: label click at \(Int(point.x)),\(Int(point.y)) split=\(target.splitID)")
-        scheduleEditLabel(for: target.splitID, currentLabel: target.badgeView.text)
+        guard activeOverlay.badgeView.isActive else {
+            return false
+        }
+
+        log("ghostty-labels: active label click at \(Int(point.x)),\(Int(point.y)) split=\(activeOverlay.splitID)")
+        scheduleEditLabel(for: activeOverlay.splitID, currentLabel: activeOverlay.badgeView.text)
         return true
     }
 
+    private func editActiveLabelIfNeeded(splitID: SplitID, currentLabel: String) {
+        guard splitID == lastActiveSplitID else {
+            return
+        }
+
+        scheduleEditLabel(for: splitID, currentLabel: currentLabel)
+    }
+
     private func scheduleEditLabel(for splitID: SplitID, currentLabel: String) {
-        guard pendingEditSplitID == nil, !isEditing else {
+        guard pendingEditSplitID == nil, editingSplitID == nil else {
             return
         }
 
@@ -483,7 +554,7 @@ private final class LabelController {
             return
         }
 
-        isEditing = true
+        editingSplitID = splitID
         lastActiveSplitID = splitID
 
         overlay.beginEditing(currentText: splitLabels[splitID] ?? currentLabel) { [weak self] result in
@@ -493,16 +564,20 @@ private final class LabelController {
 
             switch result {
             case .save(let rawLabel):
-                let label = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-                self.splitLabels[splitID] = label.isEmpty ? "Ghostty" : label
+                self.saveLabel(rawLabel, for: splitID)
             case .cancel:
                 break
             }
 
-            self.isEditing = false
+            self.editingSplitID = nil
             self.activateGhostty()
             self.refresh()
         }
+    }
+
+    private func saveLabel(_ rawLabel: String, for splitID: SplitID) {
+        let label = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        splitLabels[splitID] = label.isEmpty ? "Ghostty" : label
     }
 
     private func detectGhosttySplits() -> [DetectedSplit] {
