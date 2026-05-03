@@ -103,11 +103,31 @@ private final class BadgeView: NSView {
     }
 }
 
-private final class LabelWindow: NSPanel {
+private enum LabelEditResult {
+    case save(String)
+    case cancel
+}
+
+private final class LabelEditField: NSTextField {
+    var onCancel: (() -> Void)?
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+}
+
+private final class LabelWindow: NSPanel, NSTextFieldDelegate {
     let badgeView: BadgeView
     var splitID: SplitID
     var onEdit: ((SplitID, String) -> Void)?
     var onMouseDown: ((NSPoint) -> Void)?
+    private var editField: LabelEditField?
+    private var editCompletion: ((LabelEditResult) -> Void)?
+    private var isFinishingEdit = false
 
     init(splitID: SplitID, text: String, frame: NSRect) {
         self.splitID = splitID
@@ -135,6 +155,10 @@ private final class LabelWindow: NSPanel {
     }
 
     override var canBecomeKey: Bool {
+        true
+    }
+
+    override var canBecomeMain: Bool {
         false
     }
 
@@ -148,6 +172,85 @@ private final class LabelWindow: NSPanel {
         }
 
         super.sendEvent(event)
+    }
+
+    func beginEditing(currentText: String, onComplete: @escaping (LabelEditResult) -> Void) {
+        guard editField == nil else {
+            return
+        }
+
+        let contentBounds = contentView?.bounds ?? NSRect(origin: .zero, size: frame.size)
+        let field = LabelEditField(frame: contentBounds.insetBy(dx: 2, dy: 2))
+        field.stringValue = currentText
+        field.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        field.alignment = NSTextAlignment.center
+        field.lineBreakMode = NSLineBreakMode.byTruncatingTail
+        field.isEditable = true
+        field.isSelectable = true
+        field.isBordered = true
+        field.isBezeled = true
+        field.bezelStyle = NSTextField.BezelStyle.roundedBezel
+        field.drawsBackground = true
+        field.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1)
+        field.textColor = NSColor.white
+        field.focusRingType = NSFocusRingType.default
+        field.delegate = self
+        field.target = self
+        field.action = #selector(commitEditing)
+        field.onCancel = { [weak self] in
+            self?.cancelEditing()
+        }
+
+        isFinishingEdit = false
+        editField = field
+        editCompletion = onComplete
+        contentView = field
+        makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        DispatchQueue.main.async { [weak self, weak field] in
+            guard let self, let field, self.editField === field else {
+                return
+            }
+
+            self.makeFirstResponder(field)
+            field.currentEditor()?.selectAll(nil)
+        }
+    }
+
+    @objc private func commitEditing() {
+        guard let field = editField else {
+            return
+        }
+
+        finishEditing(.save(field.stringValue))
+    }
+
+    private func cancelEditing() {
+        finishEditing(.cancel)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard editField != nil, !isFinishingEdit else {
+            return
+        }
+
+        commitEditing()
+    }
+
+    private func finishEditing(_ result: LabelEditResult) {
+        guard !isFinishingEdit else {
+            return
+        }
+
+        isFinishingEdit = true
+        editField?.delegate = nil
+        editField = nil
+        let completion = editCompletion
+        editCompletion = nil
+        contentView = badgeView
+        completion?(result)
+        isFinishingEdit = false
     }
 }
 
@@ -284,7 +387,7 @@ private final class LabelController {
 
     private func editLabelIfNeeded(at point: NSPoint) -> Bool {
         guard !isEditing, pendingEditSplitID == nil else {
-            return true
+            return false
         }
 
         let candidates = overlays.values.filter { overlay in
@@ -317,39 +420,29 @@ private final class LabelController {
     }
 
     private func editLabel(for splitID: SplitID, currentLabel: String) {
-        isEditing = true
-        defer {
-            isEditing = false
-            activateGhostty()
-            refresh()
+        guard let overlay = overlays[splitID] else {
+            return
         }
 
-        NSApp.activate(ignoringOtherApps: true)
+        isEditing = true
+        lastActiveSplitID = splitID
 
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        input.stringValue = splitLabels[splitID] ?? currentLabel
+        overlay.beginEditing(currentText: splitLabels[splitID] ?? currentLabel) { [weak self] result in
+            guard let self else {
+                return
+            }
 
-        let alert = NSAlert()
-        alert.messageText = "Edit Ghostty Split Label"
-        alert.informativeText = "This label belongs to one Ghostty split pane."
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Reset")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = input
-        alert.window.level = .modalPanel
+            switch result {
+            case .save(let rawLabel):
+                let label = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.splitLabels[splitID] = label.isEmpty ? "Ghostty" : label
+            case .cancel:
+                break
+            }
 
-        input.selectText(nil)
-        let response = alert.runModal()
-
-        switch response {
-        case .alertFirstButtonReturn:
-            let label = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            splitLabels[splitID] = label.isEmpty ? "Ghostty" : label
-        case .alertSecondButtonReturn:
-            splitLabels[splitID] = "Ghostty"
-        default:
-            break
+            self.isEditing = false
+            self.activateGhostty()
+            self.refresh()
         }
     }
 
