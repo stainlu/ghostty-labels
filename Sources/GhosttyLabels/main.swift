@@ -12,6 +12,7 @@ private struct GhosttyWindow {
 
 private struct DetectedSplit {
     let title: String
+    let windowTitle: String
     let bounds: CGRect
     let windowBounds: CGRect
     let isFocused: Bool
@@ -20,6 +21,7 @@ private struct DetectedSplit {
 private struct GhosttySplit {
     let id: SplitID
     let title: String
+    let persistenceKey: String
     let bounds: CGRect
     let windowBounds: CGRect
     let isFocused: Bool
@@ -270,8 +272,10 @@ private final class LabelWindow: NSPanel {
 private final class LabelController {
     private var overlays: [SplitID: LabelWindow] = [:]
     private var splitLabels: [SplitID: String] = [:]
+    private var persistedLabels: [String: String] = LabelController.loadPersistedLabels()
     private var knownBoundsBySplitID: [SplitID: CGRect] = [:]
     private var knownWindowBoundsBySplitID: [SplitID: CGRect] = [:]
+    private var persistenceKeyBySplitID: [SplitID: String] = [:]
     private var nextSplitNumber = 1
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
@@ -334,6 +338,7 @@ private final class LabelController {
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
             overlays[staleID]?.close()
             overlays.removeValue(forKey: staleID)
+            persistenceKeyBySplitID.removeValue(forKey: staleID)
             if editingSplitID == staleID {
                 editingSplitID = nil
             }
@@ -400,8 +405,9 @@ private final class LabelController {
             return label
         }
 
-        splitLabels[split.id] = split.title
-        return split.title
+        let label = persistedLabels[split.persistenceKey] ?? split.title
+        splitLabels[split.id] = label
+        return label
     }
 
     private func installEventMonitors() {
@@ -672,6 +678,58 @@ private final class LabelController {
     private func saveLabel(_ rawLabel: String, for splitID: SplitID) {
         let label = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         splitLabels[splitID] = label.isEmpty ? "Ghostty" : label
+
+        guard let persistenceKey = persistenceKeyBySplitID[splitID] else {
+            return
+        }
+
+        if label.isEmpty || label == "Ghostty" {
+            persistedLabels.removeValue(forKey: persistenceKey)
+        } else {
+            persistedLabels[persistenceKey] = label
+        }
+        savePersistedLabels()
+    }
+
+    private static func labelsStoreURL() -> URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first?
+            .appendingPathComponent("Ghostty Labels", isDirectory: true)
+            .appendingPathComponent("labels.json")
+    }
+
+    private static func loadPersistedLabels() -> [String: String] {
+        guard let url = labelsStoreURL(),
+              let data = try? Data(contentsOf: url)
+        else {
+            return [:]
+        }
+
+        do {
+            return try JSONDecoder().decode([String: String].self, from: data)
+        } catch {
+            log("ghostty-labels: failed to load labels from \(url.path): \(error)")
+            return [:]
+        }
+    }
+
+    private func savePersistedLabels() {
+        guard let url = Self.labelsStoreURL() else {
+            return
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(persistedLabels)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            log("ghostty-labels: failed to save labels to \(url.path): \(error)")
+        }
     }
 
     private func detectGhosttySplits() -> [DetectedSplit] {
@@ -696,7 +754,7 @@ private final class LabelController {
 
         return axWindows.flatMap { axWindow -> [DetectedSplit] in
             guard let windowFrame = axFrame(axWindow),
-                  visibleWindows.contains(where: { samePhysicalWindow($0.bounds, windowFrame) }),
+                  let visibleWindow = visibleWindows.first(where: { samePhysicalWindow($0.bounds, windowFrame) }),
                   activeWindowFrame.map({ samePhysicalWindow($0, windowFrame) }) ?? false else {
                 return []
             }
@@ -709,6 +767,7 @@ private final class LabelController {
             return scrollFrames.map { frame in
                 DetectedSplit(
                     title: "Ghostty",
+                    windowTitle: visibleWindow.title,
                     bounds: frame,
                     windowBounds: windowFrame,
                     isFocused: focusedFrame.map { samePhysicalWindow($0, frame) || intersectionOverUnion($0, frame) > 0.8 } ?? false
@@ -750,6 +809,7 @@ private final class LabelController {
                 GhosttySplit(
                     id: splitID,
                     title: detectedSplit.title,
+                    persistenceKey: persistenceKey(for: detectedSplit),
                     bounds: detectedSplit.bounds,
                     windowBounds: detectedSplit.windowBounds,
                     isFocused: detectedSplit.isFocused
@@ -760,9 +820,32 @@ private final class LabelController {
         for split in splits {
             knownBoundsBySplitID[split.id] = split.bounds
             knownWindowBoundsBySplitID[split.id] = split.windowBounds
+            persistenceKeyBySplitID[split.id] = split.persistenceKey
         }
 
         return splits
+    }
+
+    private func persistenceKey(for split: DetectedSplit) -> String {
+        let title = split.windowTitle
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let windowTitle = title.isEmpty ? "Ghostty" : title
+        let window = split.windowBounds
+
+        guard window.width > 0, window.height > 0 else {
+            return "\(windowTitle)|absolute|\(rounded(split.bounds.minX))|\(rounded(split.bounds.minY))|\(rounded(split.bounds.width))|\(rounded(split.bounds.height))"
+        }
+
+        let relativeX = (split.bounds.minX - window.minX) / window.width
+        let relativeY = (split.bounds.minY - window.minY) / window.height
+        let relativeWidth = split.bounds.width / window.width
+        let relativeHeight = split.bounds.height / window.height
+        return "\(windowTitle)|relative|\(rounded(relativeX))|\(rounded(relativeY))|\(rounded(relativeWidth))|\(rounded(relativeHeight))"
+    }
+
+    private func rounded(_ value: CGFloat) -> String {
+        String(format: "%.3f", Double(value))
     }
 
     private func bestExistingSplitID(for detectedSplit: DetectedSplit, excluding usedIDs: Set<SplitID>) -> SplitID? {

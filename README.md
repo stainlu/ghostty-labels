@@ -19,6 +19,14 @@ The selected Ghostty split gets a red badge. Other visible Ghostty splits get gr
 
 Click a badge to edit the overlay label for that visible split pane. The label is split-wise; switching Ghostty tabs should not create another badge or change the edited label.
 
+Edited labels are saved immediately to:
+
+```text
+~/Library/Application Support/Ghostty Labels/labels.json
+```
+
+Labels are restored by matching the Ghostty window title and the split's normalized position inside that window. This survives helper restarts and normal Ghostty relaunches with the same layout.
+
 Stop it with `ctrl+c`.
 
 ## Options
