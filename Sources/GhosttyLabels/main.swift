@@ -640,8 +640,17 @@ private final class LabelController {
     private func updateEditingText(_ buffer: String, for splitID: SplitID, overlay: LabelWindow) {
         editingBuffer = buffer
         overlay.updateEditingText(buffer)
+        updateOverlayFrame(overlay, for: splitID, label: buffer)
         saveLabel(buffer, for: splitID)
         log("ghostty-labels: edit text split=\(splitID) length=\(buffer.count)")
+    }
+
+    private func updateOverlayFrame(_ overlay: LabelWindow, for splitID: SplitID, label: String) {
+        guard let splitBounds = knownBoundsBySplitID[splitID] else {
+            return
+        }
+
+        overlay.setFrame(labelFrame(forSplitBounds: splitBounds, label: label), display: true)
     }
 
     private func unicodeString(from event: CGEvent) -> String {
@@ -849,19 +858,23 @@ private final class LabelController {
     }
 
     private func labelFrame(for split: GhosttySplit, label: String) -> NSRect {
+        labelFrame(forSplitBounds: split.bounds, label: label)
+    }
+
+    private func labelFrame(forSplitBounds splitBounds: CGRect, label: String) -> NSRect {
         let size = badgeSize(for: label)
         let x: CGFloat
 
         switch position {
         case .topLeft:
-            x = split.bounds.minX + 18
+            x = splitBounds.minX + 18
         case .topCenter:
-            x = split.bounds.midX - size.width / 2
+            x = splitBounds.midX - size.width / 2
         case .topRight:
-            x = split.bounds.maxX - size.width - 18
+            x = splitBounds.maxX - size.width - 18
         }
 
-        let y = appKitY(forTopEdgeOf: split.bounds) - size.height - 12
+        let y = appKitY(forTopEdgeOf: splitBounds) - size.height - 12
         return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
 
