@@ -13,7 +13,7 @@ cd ghostty-labels
 swift run ghostty-labels
 ```
 
-When Ghostty is the frontmost app, the helper shows a floating badge on each visible Ghostty split pane.
+When Ghostty is the frontmost app, the helper shows a floating badge on each split pane in the active Ghostty window. Splits in other Ghostty windows stay hidden.
 
 The selected Ghostty split gets a red badge. Other visible Ghostty splits get grey badges so overlapping labels are easier to scan. When you click a badge, macOS briefly focuses the helper, but the last selected Ghostty split stays red.
 

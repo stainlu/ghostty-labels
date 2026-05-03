@@ -205,7 +205,6 @@ private final class LabelController {
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
             overlays[staleID]?.close()
             overlays.removeValue(forKey: staleID)
-            splitLabels.removeValue(forKey: staleID)
         }
 
         if ghosttyFrontmost {
@@ -364,6 +363,8 @@ private final class LabelController {
         let visibleWindows = visibleGhosttyWindows()
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         let focusedFrame = axFrame(axElement(axApp, kAXFocusedUIElementAttribute))
+        let focusedWindowFrame = axFrame(axElement(axApp, kAXFocusedWindowAttribute))
+        let activeWindowFrame = focusedWindowFrame ?? visibleWindows.first?.bounds
         let axWindowResult = axAttributeResult(axApp, kAXWindowsAttribute)
         let axWindows = axWindowResult.value as? [AXUIElement] ?? []
         if (axWindowResult.error != .success || axWindows.isEmpty) &&
@@ -374,7 +375,8 @@ private final class LabelController {
 
         return axWindows.flatMap { axWindow -> [DetectedSplit] in
             guard let windowFrame = axFrame(axWindow),
-                  visibleWindows.contains(where: { samePhysicalWindow($0.bounds, windowFrame) }) else {
+                  visibleWindows.contains(where: { samePhysicalWindow($0.bounds, windowFrame) }),
+                  activeWindowFrame.map({ samePhysicalWindow($0, windowFrame) }) ?? false else {
                 return []
             }
 
@@ -434,8 +436,11 @@ private final class LabelController {
             )
         }
 
-        knownBoundsBySplitID = Dictionary(uniqueKeysWithValues: splits.map { ($0.id, $0.bounds) })
-        knownWindowBoundsBySplitID = Dictionary(uniqueKeysWithValues: splits.map { ($0.id, $0.windowBounds) })
+        for split in splits {
+            knownBoundsBySplitID[split.id] = split.bounds
+            knownWindowBoundsBySplitID[split.id] = split.windowBounds
+        }
+
         return splits
     }
 
