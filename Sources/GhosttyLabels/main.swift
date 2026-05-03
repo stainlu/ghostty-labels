@@ -38,6 +38,7 @@ private enum LabelPosition: String {
 
 private final class BadgeView: NSView {
     var onClick: (() -> Void)?
+    var onKeyDown: ((NSEvent) -> Bool)?
 
     var text: String {
         didSet { needsDisplay = true }
@@ -49,6 +50,10 @@ private final class BadgeView: NSView {
 
     var isClickable: Bool = true {
         didSet { window?.invalidateCursorRects(for: self) }
+    }
+
+    var isEditing: Bool = false {
+        didSet { needsDisplay = true }
     }
 
     init(text: String) {
@@ -96,6 +101,16 @@ private final class BadgeView: NSView {
             options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
             attributes: attributes
         )
+
+        if isEditing {
+            let measured = (text as NSString).size(withAttributes: attributes)
+            let visibleTextWidth = min(measured.width, textRect.width)
+            let textStartX = textRect.midX - visibleTextWidth / 2
+            let caretX = min(textStartX + visibleTextWidth + 2, textRect.maxX - 2)
+            let caretRect = NSRect(x: caretX, y: bounds.midY - 8, width: 2, height: 16)
+            NSColor.white.setFill()
+            caretRect.fill()
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -104,6 +119,18 @@ private final class BadgeView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
+    }
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if onKeyDown?(event) == true {
+            return
+        }
+
+        super.keyDown(with: event)
     }
 
     override func resetCursorRects() {
@@ -118,30 +145,17 @@ private enum LabelEditResult {
     case cancel
 }
 
-private final class LabelEditField: NSTextField {
-    var onCancel: (() -> Void)?
-
-    override func cancelOperation(_ sender: Any?) {
-        onCancel?()
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        true
-    }
-}
-
-private final class LabelWindow: NSPanel, NSTextFieldDelegate {
+private final class LabelWindow: NSPanel {
     let badgeView: BadgeView
     var splitID: SplitID
     var onEdit: ((SplitID, String) -> Void)?
-    var onLiveEdit: ((SplitID, String) -> Void)?
     var onMouseDown: ((NSPoint) -> Void)?
-    private var editField: LabelEditField?
     private var editCompletion: ((LabelEditResult) -> Void)?
+    private var editing = false
     private var isFinishingEdit = false
 
     var isEditing: Bool {
-        editField != nil
+        editing
     }
 
     init(splitID: SplitID, text: String, frame: NSRect) {
@@ -176,7 +190,7 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
     }
 
     override var canBecomeMain: Bool {
-        false
+        true
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -192,98 +206,49 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
     }
 
     func beginEditing(currentText: String, onComplete: @escaping (LabelEditResult) -> Void) {
-        if editField != nil {
+        if editing {
             focusEditor()
             return
         }
 
-        let contentBounds = contentView?.bounds ?? NSRect(origin: .zero, size: frame.size)
-        let field = LabelEditField(frame: contentBounds.insetBy(dx: 2, dy: 2))
-        field.stringValue = currentText
-        field.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        field.alignment = NSTextAlignment.center
-        field.lineBreakMode = NSLineBreakMode.byTruncatingTail
-        field.isEditable = true
-        field.isSelectable = true
-        field.isBordered = false
-        field.isBezeled = false
-        field.drawsBackground = true
-        field.backgroundColor = NSColor(calibratedRed: 1.0, green: 0.22, blue: 0.20, alpha: 0.98)
-        field.textColor = NSColor.white
-        field.focusRingType = NSFocusRingType.none
-        field.wantsLayer = true
-        field.layer?.cornerRadius = 8
-        field.layer?.masksToBounds = true
-        field.delegate = self
-        field.target = self
-        field.action = #selector(commitEditing)
-        field.onCancel = { [weak self] in
-            self?.cancelEditing()
-        }
-
         isFinishingEdit = false
-        editField = field
         editCompletion = onComplete
-        contentView = field
+        editing = true
+        badgeView.text = currentText
+        badgeView.isEditing = true
+        contentView = badgeView
         NSApp.activate(ignoringOtherApps: true)
         makeKeyAndOrderFront(nil)
         orderFrontRegardless()
-
-        DispatchQueue.main.async { [weak self, weak field] in
-            guard let self, let field, self.editField === field else {
-                return
-            }
-
-            self.focusEditor()
-        }
+        focusEditor()
     }
 
     func focusEditor() {
-        guard let editField else {
+        guard editing else {
             return
         }
 
         NSApp.activate(ignoringOtherApps: true)
         makeKeyAndOrderFront(nil)
         orderFrontRegardless()
-        let accepted = makeFirstResponder(editField)
-        log("ghostty-labels: edit focus split=\(splitID) accepted=\(accepted)")
-        editField.currentEditor()?.selectedRange = NSRange(
-            location: (editField.stringValue as NSString).length,
-            length: 0
-        )
+        let accepted = makeFirstResponder(badgeView)
+        log("ghostty-labels: edit focus split=\(splitID) accepted=\(accepted) custom=true")
     }
 
     func finishEditingAndSave() {
-        commitEditing()
+        finishEditing(.save(badgeView.text))
     }
 
-    @objc private func commitEditing() {
-        guard let field = editField else {
+    func updateEditingText(_ text: String) {
+        guard editing else {
             return
         }
 
-        finishEditing(.save(field.stringValue))
+        badgeView.text = text
     }
 
     private func cancelEditing() {
         finishEditing(.cancel)
-    }
-
-    func controlTextDidEndEditing(_ obj: Notification) {
-        guard editField != nil, !isFinishingEdit else {
-            return
-        }
-
-        commitEditing()
-    }
-
-    func controlTextDidChange(_ obj: Notification) {
-        guard let field = editField else {
-            return
-        }
-
-        onLiveEdit?(splitID, field.stringValue)
     }
 
     private func finishEditing(_ result: LabelEditResult) {
@@ -292,8 +257,8 @@ private final class LabelWindow: NSPanel, NSTextFieldDelegate {
         }
 
         isFinishingEdit = true
-        editField?.delegate = nil
-        editField = nil
+        editing = false
+        badgeView.isEditing = false
         let completion = editCompletion
         editCompletion = nil
         contentView = badgeView
@@ -311,6 +276,7 @@ private final class LabelController {
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
     private var editingSplitID: SplitID?
+    private var editingBuffer: String?
     private var pendingEditSplitID: SplitID?
     private var lastActiveSplitID: SplitID?
     private var timer: Timer?
@@ -403,11 +369,11 @@ private final class LabelController {
                 overlay.onEdit = { [weak self] splitID, currentLabel in
                     self?.editActiveLabelIfNeeded(splitID: splitID, currentLabel: currentLabel)
                 }
-                overlay.onLiveEdit = { [weak self] splitID, rawLabel in
-                    self?.saveLabel(rawLabel, for: splitID)
-                }
                 overlay.onMouseDown = { [weak self] point in
                     _ = self?.handleLabelClick(at: point)
+                }
+                overlay.badgeView.onKeyDown = { [weak self] event in
+                    self?.handleKeyDown(event) ?? false
                 }
                 overlays[split.id] = overlay
             }
@@ -463,7 +429,8 @@ private final class LabelController {
             return
         }
 
-        let eventMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+        let eventMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue) |
+            CGEventMask(1 << CGEventType.keyDown.rawValue)
         let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -471,13 +438,20 @@ private final class LabelController {
             options: .defaultTap,
             eventsOfInterest: eventMask,
             callback: { _, type, event, refcon in
-                guard type == .leftMouseDown, let refcon else {
+                guard let refcon else {
                     return Unmanaged.passUnretained(event)
                 }
 
                 let controller = Unmanaged<LabelController>.fromOpaque(refcon).takeUnretainedValue()
-                let quartzPoint = event.location
-                let point = controller.appKitPoint(fromQuartzPoint: quartzPoint)
+                if type == .keyDown, controller.handleKeyDown(event) {
+                    return nil
+                }
+
+                guard type == .leftMouseDown else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                let point = controller.appKitPoint(fromQuartzPoint: event.location)
                 if controller.handleLabelClick(at: point) {
                     return nil
                 }
@@ -560,10 +534,12 @@ private final class LabelController {
             return
         }
 
+        let initialText = splitLabels[splitID] ?? currentLabel
         editingSplitID = splitID
+        editingBuffer = initialText
         lastActiveSplitID = splitID
 
-        overlay.beginEditing(currentText: splitLabels[splitID] ?? currentLabel) { [weak self] result in
+        overlay.beginEditing(currentText: initialText) { [weak self] result in
             guard let self else {
                 return
             }
@@ -576,8 +552,112 @@ private final class LabelController {
             }
 
             self.editingSplitID = nil
+            self.editingBuffer = nil
             self.refresh()
         }
+    }
+
+    private func handleKeyDown(_ event: CGEvent) -> Bool {
+        guard let editingSplitID,
+              let overlay = overlays[editingSplitID]
+        else {
+            return false
+        }
+
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        if keyCode == 53 {
+            overlay.finishEditingAndSave()
+            return true
+        }
+
+        if keyCode == 36 || keyCode == 76 || keyCode == 48 {
+            overlay.finishEditingAndSave()
+            return true
+        }
+
+        var buffer = editingBuffer ?? overlay.badgeView.text
+        if keyCode == 51 || keyCode == 117 {
+            if !buffer.isEmpty {
+                buffer.removeLast()
+            }
+        } else {
+            guard !event.flags.contains(.maskCommand),
+                  !event.flags.contains(.maskControl)
+            else {
+                return true
+            }
+
+            let characters = unicodeString(from: event)
+            guard !characters.isEmpty else {
+                return true
+            }
+
+            buffer += characters
+        }
+
+        updateEditingText(buffer, for: editingSplitID, overlay: overlay)
+        return true
+    }
+
+    private func handleKeyDown(_ event: NSEvent) -> Bool {
+        guard let editingSplitID,
+              let overlay = overlays[editingSplitID]
+        else {
+            return false
+        }
+
+        switch event.keyCode {
+        case 53:
+            overlay.finishEditingAndSave()
+            return true
+        case 36, 76, 48:
+            overlay.finishEditingAndSave()
+            return true
+        case 51, 117:
+            var buffer = editingBuffer ?? overlay.badgeView.text
+            if !buffer.isEmpty {
+                buffer.removeLast()
+            }
+            updateEditingText(buffer, for: editingSplitID, overlay: overlay)
+            return true
+        default:
+            guard !event.modifierFlags.contains(.command),
+                  !event.modifierFlags.contains(.control)
+            else {
+                return true
+            }
+
+            guard let characters = event.characters, !characters.isEmpty else {
+                return true
+            }
+
+            let buffer = (editingBuffer ?? overlay.badgeView.text) + characters
+            updateEditingText(buffer, for: editingSplitID, overlay: overlay)
+            return true
+        }
+    }
+
+    private func updateEditingText(_ buffer: String, for splitID: SplitID, overlay: LabelWindow) {
+        editingBuffer = buffer
+        overlay.updateEditingText(buffer)
+        saveLabel(buffer, for: splitID)
+        log("ghostty-labels: edit text split=\(splitID) length=\(buffer.count)")
+    }
+
+    private func unicodeString(from event: CGEvent) -> String {
+        var length = 0
+        var chars = [UniChar](repeating: 0, count: 8)
+        event.keyboardGetUnicodeString(
+            maxStringLength: chars.count,
+            actualStringLength: &length,
+            unicodeString: &chars
+        )
+
+        guard length > 0 else {
+            return ""
+        }
+
+        return String(utf16CodeUnits: chars, count: length)
     }
 
     private func saveLabel(_ rawLabel: String, for splitID: SplitID) {
