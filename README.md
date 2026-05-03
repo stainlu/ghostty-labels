@@ -42,7 +42,15 @@ scripts/install-app.sh
 
 This builds `dist/Ghostty Labels.app`, installs a signed copy at `~/Applications/Ghostty Labels.app`, installs the LaunchAgent, and starts it.
 
-After installing or rebuilding, macOS may require re-granting Accessibility permission to the freshly signed app:
+The installer signs the app with a stable designated requirement:
+
+```text
+designated => identifier "com.stainlu.ghostty-labels"
+```
+
+That keeps the app's macOS privacy identity stable across rebuilds. Without this, ad-hoc signing defaults to a per-build `cdhash`, so Accessibility can look enabled in System Settings while macOS still denies the rebuilt helper.
+
+The first install after switching from the old per-build signature may require clearing the stale Accessibility entry and granting it once:
 
 1. Open System Settings > Privacy & Security > Accessibility.
 2. Grant or toggle `Ghostty Labels` from `~/Applications`.
