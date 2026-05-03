@@ -10,9 +10,17 @@ private struct GhosttyWindow {
     let bounds: CGRect
 }
 
+private struct ActiveGhosttyWindow {
+    let title: String
+    let persistenceName: String
+    let bounds: CGRect
+    let axWindow: AXUIElement
+}
+
 private struct DetectedSplit {
     let title: String
     let windowTitle: String
+    let windowPersistenceName: String
     let bounds: CGRect
     let windowBounds: CGRect
     let isFocused: Bool
@@ -22,6 +30,7 @@ private struct GhosttySplit {
     let id: SplitID
     let title: String
     let persistenceKey: String
+    let legacyPersistenceKeys: [String]
     let bounds: CGRect
     let windowBounds: CGRect
     let isFocused: Bool
@@ -271,11 +280,11 @@ private final class LabelWindow: NSPanel {
 
 private final class LabelController {
     private var overlays: [SplitID: LabelWindow] = [:]
-    private var splitLabels: [SplitID: String] = [:]
     private var persistedLabels: [String: String] = LabelController.loadPersistedLabels()
     private var knownBoundsBySplitID: [SplitID: CGRect] = [:]
     private var knownWindowBoundsBySplitID: [SplitID: CGRect] = [:]
     private var persistenceKeyBySplitID: [SplitID: String] = [:]
+    private var titleAliasesByWindowName: [String: Set<String>] = [:]
     private var nextSplitNumber = 1
     private let position = LabelPosition.configured
     private let alwaysShow = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_ALWAYS"] == "1"
@@ -283,7 +292,7 @@ private final class LabelController {
     private var editingBuffer: String?
     private var pendingEditSplitID: SplitID?
     private var lastActiveSplitID: SplitID?
-    private var lastActiveGhosttyWindowBounds: CGRect?
+    private var lastActiveGhosttyWindow: ActiveGhosttyWindow?
     private var timer: Timer?
     private var eventMonitorTokens: [Any] = []
     private var eventTap: CFMachPort?
@@ -327,24 +336,21 @@ private final class LabelController {
             return
         }
 
-        let visibleWindows = visibleGhosttyWindows()
-        let activeWindowBounds: CGRect?
-        if ghosttyFrontmost {
-            activeWindowBounds = visibleWindows.first?.bounds
-            lastActiveGhosttyWindowBounds = activeWindowBounds
-        } else {
-            activeWindowBounds = lastActiveGhosttyWindowBounds
+        let activeWindow = activeGhosttyWindow() ?? lastActiveGhosttyWindow
+        if ghosttyFrontmost || helperFrontmost {
+            lastActiveGhosttyWindow = activeWindow
         }
 
-        guard let activeWindowBounds else {
+        guard let activeWindow else {
             removeAllOverlays()
             return
         }
+        rememberWindowTitle(activeWindow)
 
-        let detectedSplits = detectGhosttySplits(in: activeWindowBounds, visibleWindows: visibleWindows)
+        let detectedSplits = detectGhosttySplits(in: activeWindow)
         if lastReportedSplitCount != detectedSplits.count {
             lastReportedSplitCount = detectedSplits.count
-            log("ghostty-labels: detected \(detectedSplits.count) Ghostty split pane(s)")
+            log("ghostty-labels: detected \(detectedSplits.count) Ghostty split pane(s) in window=\(activeWindow.title)")
         }
 
         let splits = assignStableIDs(to: detectedSplits)
@@ -416,13 +422,19 @@ private final class LabelController {
     }
 
     private func labelText(for split: GhosttySplit) -> String {
-        if let label = splitLabels[split.id] {
+        if let label = persistedLabels[split.persistenceKey] {
             return label
         }
 
-        let label = persistedLabels[split.persistenceKey] ?? split.title
-        splitLabels[split.id] = label
-        return label
+        for legacyKey in split.legacyPersistenceKeys {
+            if let label = persistedLabels[legacyKey] {
+                persistedLabels[split.persistenceKey] = label
+                savePersistedLabels()
+                return label
+            }
+        }
+
+        return split.title
     }
 
     private func installEventMonitors() {
@@ -555,7 +567,7 @@ private final class LabelController {
             return
         }
 
-        let initialText = splitLabels[splitID] ?? currentLabel
+        let initialText = persistenceKeyBySplitID[splitID].flatMap { persistedLabels[$0] } ?? currentLabel
         editingSplitID = splitID
         editingBuffer = initialText
         lastActiveSplitID = splitID
@@ -692,7 +704,6 @@ private final class LabelController {
 
     private func saveLabel(_ rawLabel: String, for splitID: SplitID) {
         let label = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        splitLabels[splitID] = label.isEmpty ? "Ghostty" : label
 
         guard let persistenceKey = persistenceKeyBySplitID[splitID] else {
             return
@@ -747,7 +758,44 @@ private final class LabelController {
         }
     }
 
-    private func detectGhosttySplits(in activeWindowBounds: CGRect, visibleWindows: [GhosttyWindow]) -> [DetectedSplit] {
+    private func activeGhosttyWindow() -> ActiveGhosttyWindow? {
+        guard let app = ghosttyApplication() else {
+            return nil
+        }
+
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focusedWindow = axElement(axApp, kAXFocusedWindowAttribute),
+              let focusedFrame = axFrame(focusedWindow)
+        else {
+            return nil
+        }
+
+        let visibleWindows = visibleGhosttyWindows()
+        let focusedTitle = normalizedTitle(axString(focusedWindow, kAXTitleAttribute))
+        let visibleWindow = matchingVisibleWindow(
+            forFrame: focusedFrame,
+            title: focusedTitle,
+            in: visibleWindows
+        )
+        let visibleTitle = visibleWindow.map { normalizedTitle($0.title) } ?? ""
+        let title = firstMeaningfulTitle(focusedTitle, visibleTitle) ?? "Ghostty"
+        let persistenceName = persistenceWindowName(
+            forTitle: title,
+            visibleWindow: visibleWindow,
+            visibleWindows: visibleWindows,
+            app: app,
+            frame: focusedFrame
+        )
+
+        return ActiveGhosttyWindow(
+            title: title,
+            persistenceName: persistenceName,
+            bounds: focusedFrame,
+            axWindow: focusedWindow
+        )
+    }
+
+    private func detectGhosttySplits(in activeWindow: ActiveGhosttyWindow) -> [DetectedSplit] {
         _ = hasAccessibilityPermission()
 
         guard let app = ghosttyApplication() else {
@@ -756,35 +804,22 @@ private final class LabelController {
 
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         let focusedFrame = axFrame(axElement(axApp, kAXFocusedUIElementAttribute))
-        let axWindowResult = axAttributeResult(axApp, kAXWindowsAttribute)
-        let axWindows = axWindowResult.value as? [AXUIElement] ?? []
-        if (axWindowResult.error != .success || axWindows.isEmpty) &&
-            Date().timeIntervalSince(lastAXWindowErrorLogTime) > 5 {
+        let scrollFrames = uniqueFrames(terminalScrollAreaFrames(in: activeWindow.axWindow, windowFrame: activeWindow.bounds))
+        if scrollFrames.isEmpty,
+           Date().timeIntervalSince(lastAXWindowErrorLogTime) > 5 {
             lastAXWindowErrorLogTime = Date()
-            log("ghostty-labels: ax windows error=\(axWindowResult.error.rawValue) trusted=\(AXIsProcessTrusted()) visibleWindows=\(visibleWindows.count) axWindows=\(axWindows.count)")
+            log("ghostty-labels: active window has no scroll areas trusted=\(AXIsProcessTrusted()) window=\(activeWindow.title)")
         }
 
-        return axWindows.flatMap { axWindow -> [DetectedSplit] in
-            guard let windowFrame = axFrame(axWindow),
-                  let visibleWindow = visibleWindows.first(where: { samePhysicalWindow($0.bounds, windowFrame) }),
-                  samePhysicalWindow(activeWindowBounds, windowFrame) else {
-                return []
-            }
-
-            let scrollFrames = uniqueFrames(terminalScrollAreaFrames(in: axWindow, windowFrame: windowFrame))
-            if scrollFrames.isEmpty {
-                return []
-            }
-
-            return scrollFrames.map { frame in
-                DetectedSplit(
-                    title: "Ghostty",
-                    windowTitle: visibleWindow.title,
-                    bounds: frame,
-                    windowBounds: windowFrame,
-                    isFocused: focusedFrame.map { samePhysicalWindow($0, frame) || intersectionOverUnion($0, frame) > 0.8 } ?? false
-                )
-            }
+        return scrollFrames.map { frame in
+            DetectedSplit(
+                title: "Ghostty",
+                windowTitle: activeWindow.title,
+                windowPersistenceName: activeWindow.persistenceName,
+                bounds: frame,
+                windowBounds: activeWindow.bounds,
+                isFocused: focusedFrame.map { samePhysicalWindow($0, frame) || intersectionOverUnion($0, frame) > 0.8 } ?? false
+            )
         }
     }
 
@@ -822,6 +857,7 @@ private final class LabelController {
                     id: splitID,
                     title: detectedSplit.title,
                     persistenceKey: persistenceKey(for: detectedSplit),
+                    legacyPersistenceKeys: legacyPersistenceKeys(for: detectedSplit),
                     bounds: detectedSplit.bounds,
                     windowBounds: detectedSplit.windowBounds,
                     isFocused: detectedSplit.isFocused
@@ -839,10 +875,18 @@ private final class LabelController {
     }
 
     private func persistenceKey(for split: DetectedSplit) -> String {
-        let title = split.windowTitle
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let windowTitle = title.isEmpty ? "Ghostty" : title
+        persistenceKey(for: split, windowName: split.windowPersistenceName)
+    }
+
+    private func legacyPersistenceKeys(for split: DetectedSplit) -> [String] {
+        let aliases = titleAliasesByWindowName[split.windowPersistenceName] ?? []
+        return aliases
+            .filter { !$0.isEmpty && $0 != split.windowPersistenceName }
+            .map { persistenceKey(for: split, windowName: $0) }
+    }
+
+    private func persistenceKey(for split: DetectedSplit, windowName: String) -> String {
+        let windowTitle = normalizedTitle(windowName).isEmpty ? "Ghostty" : normalizedTitle(windowName)
         let window = split.windowBounds
 
         guard window.width > 0, window.height > 0 else {
@@ -858,6 +902,55 @@ private final class LabelController {
 
     private func rounded(_ value: CGFloat) -> String {
         String(format: "%.3f", Double(value))
+    }
+
+    private func normalizedTitle(_ title: String) -> String {
+        title
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func firstMeaningfulTitle(_ titles: String...) -> String? {
+        titles
+            .map(normalizedTitle)
+            .first { !$0.isEmpty && $0 != "Ghostty" }
+    }
+
+    private func matchingVisibleWindow(
+        forFrame frame: CGRect,
+        title: String,
+        in visibleWindows: [GhosttyWindow]
+    ) -> GhosttyWindow? {
+        let normalized = normalizedTitle(title)
+        return visibleWindows.first {
+            samePhysicalWindow($0.bounds, frame) &&
+                (normalized.isEmpty || normalizedTitle($0.title) == normalized)
+        } ?? visibleWindows.first {
+            samePhysicalWindow($0.bounds, frame)
+        }
+    }
+
+    private func persistenceWindowName(
+        forTitle title: String,
+        visibleWindow: GhosttyWindow?,
+        visibleWindows: [GhosttyWindow],
+        app: NSRunningApplication,
+        frame: CGRect
+    ) -> String {
+        if let visibleWindow {
+            return "window:\(app.processIdentifier):\(visibleWindow.id)"
+        }
+
+        return "window:\(app.processIdentifier):\(rounded(frame.minX)):\(rounded(frame.minY)):\(rounded(frame.width)):\(rounded(frame.height))"
+    }
+
+    private func rememberWindowTitle(_ window: ActiveGhosttyWindow) {
+        let title = normalizedTitle(window.title)
+        guard !title.isEmpty, title != "Ghostty" else {
+            return
+        }
+
+        titleAliasesByWindowName[window.persistenceName, default: []].insert(title)
     }
 
     private func bestExistingSplitID(for detectedSplit: DetectedSplit, excluding usedIDs: Set<SplitID>) -> SplitID? {
