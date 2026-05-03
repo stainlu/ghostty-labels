@@ -283,6 +283,7 @@ private final class LabelController {
     private var editingBuffer: String?
     private var pendingEditSplitID: SplitID?
     private var lastActiveSplitID: SplitID?
+    private var lastActiveGhosttyWindowBounds: CGRect?
     private var timer: Timer?
     private var eventMonitorTokens: [Any] = []
     private var eventTap: CFMachPort?
@@ -326,7 +327,21 @@ private final class LabelController {
             return
         }
 
-        let detectedSplits = detectGhosttySplits()
+        let visibleWindows = visibleGhosttyWindows()
+        let activeWindowBounds: CGRect?
+        if ghosttyFrontmost {
+            activeWindowBounds = visibleWindows.first?.bounds
+            lastActiveGhosttyWindowBounds = activeWindowBounds
+        } else {
+            activeWindowBounds = lastActiveGhosttyWindowBounds
+        }
+
+        guard let activeWindowBounds else {
+            removeAllOverlays()
+            return
+        }
+
+        let detectedSplits = detectGhosttySplits(in: activeWindowBounds, visibleWindows: visibleWindows)
         if lastReportedSplitCount != detectedSplits.count {
             lastReportedSplitCount = detectedSplits.count
             log("ghostty-labels: detected \(detectedSplits.count) Ghostty split pane(s)")
@@ -732,18 +747,15 @@ private final class LabelController {
         }
     }
 
-    private func detectGhosttySplits() -> [DetectedSplit] {
+    private func detectGhosttySplits(in activeWindowBounds: CGRect, visibleWindows: [GhosttyWindow]) -> [DetectedSplit] {
         _ = hasAccessibilityPermission()
 
         guard let app = ghosttyApplication() else {
             return []
         }
 
-        let visibleWindows = visibleGhosttyWindows()
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         let focusedFrame = axFrame(axElement(axApp, kAXFocusedUIElementAttribute))
-        let focusedWindowFrame = axFrame(axElement(axApp, kAXFocusedWindowAttribute))
-        let activeWindowFrame = focusedWindowFrame ?? visibleWindows.first?.bounds
         let axWindowResult = axAttributeResult(axApp, kAXWindowsAttribute)
         let axWindows = axWindowResult.value as? [AXUIElement] ?? []
         if (axWindowResult.error != .success || axWindows.isEmpty) &&
@@ -755,7 +767,7 @@ private final class LabelController {
         return axWindows.flatMap { axWindow -> [DetectedSplit] in
             guard let windowFrame = axFrame(axWindow),
                   let visibleWindow = visibleWindows.first(where: { samePhysicalWindow($0.bounds, windowFrame) }),
-                  activeWindowFrame.map({ samePhysicalWindow($0, windowFrame) }) ?? false else {
+                  samePhysicalWindow(activeWindowBounds, windowFrame) else {
                 return []
             }
 
