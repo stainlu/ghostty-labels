@@ -22,6 +22,8 @@
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Ghostty Labels reads Ghostty window, tab, and terminal IDs to keep split labels stable.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 stainlu</string>
 </dict>

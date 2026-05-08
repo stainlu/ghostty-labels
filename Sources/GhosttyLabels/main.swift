@@ -18,11 +18,19 @@ private struct ActiveGhosttyWindow {
     let axWindow: AXUIElement
 }
 
+private struct GhosttyScriptContext {
+    let signature: String
+    let windowID: String
+    let tabID: String
+    let terminalIDs: [String]
+}
+
 private struct DetectedSplit {
     let title: String
     let windowTitle: String
     let windowPersistenceName: String
     let windowLegacyPersistenceNames: [String]
+    let terminalID: String?
     let bounds: CGRect
     let windowBounds: CGRect
     let isFocused: Bool
@@ -36,6 +44,11 @@ private struct GhosttySplit {
     let bounds: CGRect
     let windowBounds: CGRect
     let isFocused: Bool
+}
+
+private struct ParsedRelativePersistenceKey {
+    let windowName: String
+    let bounds: CGRect
 }
 
 private enum LabelPosition: String {
@@ -285,6 +298,7 @@ private final class LabelController {
     private var persistedLabels: [String: String] = LabelController.loadPersistedLabels()
     private var knownBoundsBySplitID: [SplitID: CGRect] = [:]
     private var knownWindowBoundsBySplitID: [SplitID: CGRect] = [:]
+    private var knownRelativeBoundsBySplitID: [SplitID: CGRect] = [:]
     private var persistenceKeyBySplitID: [SplitID: String] = [:]
     private var titleAliasesByWindowName: [String: Set<String>] = [:]
     private var nextSplitNumber = 1
@@ -295,10 +309,19 @@ private final class LabelController {
     private var pendingEditSplitID: SplitID?
     private var lastActiveSplitID: SplitID?
     private var lastActiveGhosttyWindow: ActiveGhosttyWindow?
+    private var trackedAXWindow: AXUIElement?
+    private var trackedWindowPersistenceName: String?
+    private var scriptContext: GhosttyScriptContext?
+    private var scriptContextLoadStartedAt = Date.distantPast
+    private var scriptContextLogTime = Date.distantPast
+    private var scriptContextGeneration = 0
+    private var isLoadingScriptContext = false
+    private var pendingLabelsSave: DispatchWorkItem?
     private var timer: Timer?
     private var eventMonitorTokens: [Any] = []
     private var eventTap: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
+    private let debugLogging = ProcessInfo.processInfo.environment["GHOSTTY_LABEL_DEBUG"] == "1"
     private var warnedAboutAccessibility = false
     private var lastReportedSplitCount: Int?
     private var lastAXWindowErrorLogTime = Date.distantPast
@@ -327,8 +350,12 @@ private final class LabelController {
             return
         }
 
-        if AXIsProcessTrusted(), eventTap == nil {
-            installEventTap()
+        if AXIsProcessTrusted() {
+            if eventTap == nil {
+                installEventTap()
+            } else {
+                ensureEventTapEnabled()
+            }
         }
 
         let ghosttyFrontmost = isGhosttyFrontmost()
@@ -348,6 +375,7 @@ private final class LabelController {
             return
         }
         rememberWindowTitle(activeWindow)
+        resetSplitTrackingIfNeeded(for: activeWindow)
 
         let detectedSplits = detectGhosttySplits(in: activeWindow)
         if lastReportedSplitCount != detectedSplits.count {
@@ -361,6 +389,9 @@ private final class LabelController {
         for staleID in overlays.keys where !liveIDs.contains(staleID) {
             overlays[staleID]?.close()
             overlays.removeValue(forKey: staleID)
+            knownBoundsBySplitID.removeValue(forKey: staleID)
+            knownWindowBoundsBySplitID.removeValue(forKey: staleID)
+            knownRelativeBoundsBySplitID.removeValue(forKey: staleID)
             persistenceKeyBySplitID.removeValue(forKey: staleID)
             if editingSplitID == staleID {
                 editingSplitID = nil
@@ -423,6 +454,29 @@ private final class LabelController {
         overlays.removeAll()
     }
 
+    private func resetSplitTrackingIfNeeded(for activeWindow: ActiveGhosttyWindow) {
+        let activeWindowNames = Set([activeWindow.persistenceName] + activeWindow.legacyPersistenceNames)
+        let sameTrackedWindow = trackedAXWindow.map { sameAXElement($0, activeWindow.axWindow) } == true ||
+            trackedWindowPersistenceName.map { activeWindowNames.contains($0) } == true
+
+        if trackedAXWindow != nil,
+           !sameTrackedWindow {
+            removeAllOverlays()
+            knownBoundsBySplitID.removeAll()
+            knownWindowBoundsBySplitID.removeAll()
+            knownRelativeBoundsBySplitID.removeAll()
+            persistenceKeyBySplitID.removeAll()
+            lastActiveSplitID = nil
+            nextSplitNumber = 1
+            scriptContext = nil
+            scriptContextLoadStartedAt = Date.distantPast
+            scriptContextGeneration += 1
+        }
+
+        trackedAXWindow = activeWindow.axWindow
+        trackedWindowPersistenceName = activeWindow.persistenceName
+    }
+
     private func labelText(for split: GhosttySplit) -> String {
         if let label = persistedLabels[split.persistenceKey] {
             return label
@@ -436,7 +490,133 @@ private final class LabelController {
             }
         }
 
+        if let label = approximateLegacyLabel(for: split) {
+            return label
+        }
+
         return split.title
+    }
+
+    private func approximateLegacyLabel(for split: GhosttySplit) -> String? {
+        let targetBounds = relativeBounds(for: split.bounds, in: split.windowBounds)
+        let targetNames = Set(([split.persistenceKey] + split.legacyPersistenceKeys)
+            .compactMap(parseRelativePersistenceKey)
+            .map(\.windowName))
+        guard !targetNames.isEmpty else {
+            return nil
+        }
+
+        var bestMatch: (key: String, label: String, score: CGFloat)?
+        for (key, label) in persistedLabels {
+            guard let parsed = parseRelativePersistenceKey(key),
+                  targetNames.contains(parsed.windowName)
+            else {
+                continue
+            }
+
+            let score = intersectionOverUnion(parsed.bounds, targetBounds)
+            if bestMatch == nil || score > bestMatch!.score {
+                bestMatch = (key, label, score)
+            }
+        }
+
+        guard let bestMatch,
+              bestMatch.score >= 0.65
+        else {
+            return nil
+        }
+
+        persistedLabels[split.persistenceKey] = bestMatch.label
+        savePersistedLabels()
+        log("ghostty-labels: migrated approximate label key=\(bestMatch.key) score=\(rounded(bestMatch.score))")
+        return bestMatch.label
+    }
+
+    private func refreshScriptContextIfNeeded(for activeWindow: ActiveGhosttyWindow, splitCount: Int) {
+        guard splitCount > 0 else {
+            return
+        }
+
+        let signature = scriptContextSignature(for: activeWindow, splitCount: splitCount)
+        if scriptContext?.signature == signature,
+           scriptContext?.terminalIDs.count == splitCount {
+            return
+        }
+
+        let now = Date()
+        guard !isLoadingScriptContext,
+              now.timeIntervalSince(scriptContextLoadStartedAt) >= 1.5
+        else {
+            return
+        }
+
+        isLoadingScriptContext = true
+        scriptContextLoadStartedAt = now
+        let generation = scriptContextGeneration
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Self.loadGhosttyScriptContext(signature: signature)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isLoadingScriptContext = false
+                guard generation == self.scriptContextGeneration else {
+                    return
+                }
+                self.scriptContext = result.context
+                if let error = result.error,
+                   Date().timeIntervalSince(self.scriptContextLogTime) > 10 {
+                    self.scriptContextLogTime = Date()
+                    log("ghostty-labels: Ghostty scripting IDs unavailable: \(error)")
+                }
+                if result.context != nil, !self.isEditing {
+                    self.refresh()
+                }
+            }
+        }
+    }
+
+    private func scriptContextSignature(for activeWindow: ActiveGhosttyWindow, splitCount: Int) -> String {
+        "\(activeWindow.persistenceName)|splits:\(splitCount)"
+    }
+
+    private static func loadGhosttyScriptContext(signature: String) -> (context: GhosttyScriptContext?, error: String?) {
+        let source = """
+        set AppleScript's text item delimiters to linefeed
+        tell application "Ghostty"
+            set w to front window
+            set t to selected tab of w
+            set terminalIds to id of terminals of t
+            return (id of w) & linefeed & (id of t) & linefeed & (terminalIds as text)
+        end tell
+        """
+
+        guard let script = NSAppleScript(source: source) else {
+            return (nil, "failed to create AppleScript")
+        }
+
+        var errorInfo: NSDictionary?
+        let descriptor = script.executeAndReturnError(&errorInfo)
+        if let errorInfo {
+            return (nil, String(describing: errorInfo))
+        }
+
+        let output = descriptor.stringValue ?? ""
+        let lines = output
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard lines.count >= 3 else {
+            return (nil, "expected window, tab, and terminal IDs; got \(lines.count) line(s)")
+        }
+
+        return (
+            GhosttyScriptContext(
+                signature: signature,
+                windowID: lines[0],
+                tabID: lines[1],
+                terminalIDs: Array(lines.dropFirst(2))
+            ),
+            nil
+        )
     }
 
     private func installEventMonitors() {
@@ -478,6 +658,16 @@ private final class LabelController {
                 }
 
                 let controller = Unmanaged<LabelController>.fromOpaque(refcon).takeUnretainedValue()
+                if type == .tapDisabledByTimeout {
+                    controller.reenableEventTap(reason: "timeout")
+                    return Unmanaged.passUnretained(event)
+                }
+
+                if type == .tapDisabledByUserInput {
+                    controller.reenableEventTap(reason: "user-input")
+                    return Unmanaged.passUnretained(event)
+                }
+
                 if type == .keyDown, controller.handleKeyDown(event) {
                     return nil
                 }
@@ -486,7 +676,7 @@ private final class LabelController {
                     return Unmanaged.passUnretained(event)
                 }
 
-                let point = controller.appKitPoint(fromQuartzPoint: event.location)
+                let point = event.unflippedLocation
                 if controller.handleLabelClick(at: point) {
                     return nil
                 }
@@ -511,6 +701,26 @@ private final class LabelController {
         log("ghostty-labels: mouse event tap installed")
     }
 
+    private func ensureEventTapEnabled() {
+        guard let eventTap,
+              !CGEvent.tapIsEnabled(tap: eventTap)
+        else {
+            return
+        }
+
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        log("ghostty-labels: mouse event tap re-enabled")
+    }
+
+    private func reenableEventTap(reason: String) {
+        guard let eventTap else {
+            return
+        }
+
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        log("ghostty-labels: mouse event tap re-enabled after \(reason)")
+    }
+
     private func handleLabelClick(at point: NSPoint) -> Bool {
         if let editingSplitID, let editingOverlay = overlays[editingSplitID] {
             if editingOverlay.frame.contains(point) {
@@ -522,19 +732,21 @@ private final class LabelController {
             return false
         }
 
-        guard pendingEditSplitID == nil,
-              let activeSplitID = lastActiveSplitID,
-              let activeOverlay = overlays[activeSplitID],
-              activeOverlay.isVisible,
-              activeOverlay.frame.contains(point)
+        guard pendingEditSplitID == nil
         else {
             return false
         }
 
-        guard activeOverlay.badgeView.isActive else {
+        guard let activeOverlay = overlays.values.first(where: { overlay in
+            overlay.isVisible &&
+                !overlay.ignoresMouseEvents &&
+                overlay.badgeView.isActive &&
+                overlay.frame.contains(point)
+        }) else {
             return false
         }
 
+        lastActiveSplitID = activeOverlay.splitID
         log("ghostty-labels: active label click at \(Int(point.x)),\(Int(point.y)) split=\(activeOverlay.splitID)")
         scheduleEditLabel(for: activeOverlay.splitID, currentLabel: activeOverlay.badgeView.text)
         return true
@@ -581,7 +793,7 @@ private final class LabelController {
 
             switch result {
             case .save(let rawLabel):
-                self.saveLabel(rawLabel, for: splitID)
+                self.saveLabel(rawLabel, for: splitID, flush: true)
             case .cancel:
                 break
             }
@@ -677,7 +889,9 @@ private final class LabelController {
         overlay.updateEditingText(buffer)
         updateOverlayFrame(overlay, for: splitID, label: buffer)
         saveLabel(buffer, for: splitID)
-        log("ghostty-labels: edit text split=\(splitID) length=\(buffer.count)")
+        if debugLogging {
+            log("ghostty-labels: edit text split=\(splitID) length=\(buffer.count)")
+        }
     }
 
     private func updateOverlayFrame(_ overlay: LabelWindow, for splitID: SplitID, label: String) {
@@ -704,7 +918,7 @@ private final class LabelController {
         return String(utf16CodeUnits: chars, count: length)
     }
 
-    private func saveLabel(_ rawLabel: String, for splitID: SplitID) {
+    private func saveLabel(_ rawLabel: String, for splitID: SplitID, flush: Bool = false) {
         let label = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard let persistenceKey = persistenceKeyBySplitID[splitID] else {
@@ -716,7 +930,12 @@ private final class LabelController {
         } else {
             persistedLabels[persistenceKey] = label
         }
-        savePersistedLabels()
+
+        if flush {
+            savePersistedLabels()
+        } else {
+            schedulePersistedLabelsSave()
+        }
     }
 
     private static func labelsStoreURL() -> URL? {
@@ -742,6 +961,9 @@ private final class LabelController {
     }
 
     private func savePersistedLabels() {
+        pendingLabelsSave?.cancel()
+        pendingLabelsSave = nil
+
         guard let url = Self.labelsStoreURL() else {
             return
         }
@@ -758,6 +980,15 @@ private final class LabelController {
         } catch {
             log("ghostty-labels: failed to save labels to \(url.path): \(error)")
         }
+    }
+
+    private func schedulePersistedLabelsSave() {
+        pendingLabelsSave?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.savePersistedLabels()
+        }
+        pendingLabelsSave = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
     }
 
     private func activeGhosttyWindow() -> ActiveGhosttyWindow? {
@@ -826,12 +1057,34 @@ private final class LabelController {
             log("ghostty-labels: active window has no scroll areas trusted=\(AXIsProcessTrusted()) window=\(activeWindow.title)")
         }
 
-        return scrollFrames.map { frame in
+        let scriptSignature = scriptContextSignature(for: activeWindow, splitCount: scrollFrames.count)
+        refreshScriptContextIfNeeded(for: activeWindow, splitCount: scrollFrames.count)
+        let terminalIDs: [String]? = {
+            guard let scriptContext,
+                  scriptContext.signature == scriptSignature,
+                  scriptContext.terminalIDs.count == scrollFrames.count
+            else {
+                return nil
+            }
+
+            return scriptContext.terminalIDs
+        }()
+
+        if let scriptContext,
+           scriptContext.signature == scriptSignature,
+           scriptContext.terminalIDs.count != scrollFrames.count,
+           Date().timeIntervalSince(scriptContextLogTime) > 10 {
+            scriptContextLogTime = Date()
+            log("ghostty-labels: Ghostty scripting split count mismatch ids=\(scriptContext.terminalIDs.count) ax=\(scrollFrames.count) windowID=\(scriptContext.windowID) tabID=\(scriptContext.tabID)")
+        }
+
+        return scrollFrames.enumerated().map { index, frame in
             DetectedSplit(
                 title: "Ghostty",
                 windowTitle: activeWindow.title,
                 windowPersistenceName: activeWindow.persistenceName,
                 windowLegacyPersistenceNames: activeWindow.legacyPersistenceNames,
+                terminalID: terminalIDs?[index],
                 bounds: frame,
                 windowBounds: activeWindow.bounds,
                 isFocused: focusedFrame.map { samePhysicalWindow($0, frame) || intersectionOverUnion($0, frame) > 0.8 } ?? false
@@ -867,13 +1120,19 @@ private final class LabelController {
 
         for detectedSplit in detectedSplits {
             let splitID = bestExistingSplitID(for: detectedSplit, excluding: usedIDs) ?? newSplitID()
+            let persistenceKey = persistenceKey(for: detectedSplit)
+            let legacyPersistenceKeys = legacyPersistenceKeys(
+                for: detectedSplit,
+                primaryKey: persistenceKey,
+                previousKey: persistenceKeyBySplitID[splitID]
+            )
             usedIDs.insert(splitID)
             splits.append(
                 GhosttySplit(
                     id: splitID,
                     title: detectedSplit.title,
-                    persistenceKey: persistenceKey(for: detectedSplit),
-                    legacyPersistenceKeys: legacyPersistenceKeys(for: detectedSplit),
+                    persistenceKey: persistenceKey,
+                    legacyPersistenceKeys: legacyPersistenceKeys,
                     bounds: detectedSplit.bounds,
                     windowBounds: detectedSplit.windowBounds,
                     isFocused: detectedSplit.isFocused
@@ -884,6 +1143,7 @@ private final class LabelController {
         for split in splits {
             knownBoundsBySplitID[split.id] = split.bounds
             knownWindowBoundsBySplitID[split.id] = split.windowBounds
+            knownRelativeBoundsBySplitID[split.id] = relativeBounds(for: split.bounds, in: split.windowBounds)
             persistenceKeyBySplitID[split.id] = split.persistenceKey
         }
 
@@ -891,17 +1151,29 @@ private final class LabelController {
     }
 
     private func persistenceKey(for split: DetectedSplit) -> String {
-        persistenceKey(for: split, windowName: split.windowPersistenceName)
+        if let terminalID = split.terminalID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !terminalID.isEmpty {
+            return "terminal:\(terminalID)"
+        }
+
+        return persistenceKey(for: split, windowName: split.windowPersistenceName)
     }
 
-    private func legacyPersistenceKeys(for split: DetectedSplit) -> [String] {
+    private func legacyPersistenceKeys(
+        for split: DetectedSplit,
+        primaryKey: String,
+        previousKey: String?
+    ) -> [String] {
         let windowNames = [split.windowPersistenceName] + split.windowLegacyPersistenceNames
         let aliases = windowNames.flatMap { titleAliasesByWindowName[$0] ?? [] }
-        let legacyWindowNames = split.windowLegacyPersistenceNames + aliases
-
-        return uniqueStrings(legacyWindowNames)
-            .filter { !$0.isEmpty && $0 != split.windowPersistenceName }
+        let legacyWindowNames = windowNames + aliases
+        let geometryKeys = uniqueStrings(legacyWindowNames)
+            .filter { !$0.isEmpty }
             .map { persistenceKey(for: split, windowName: $0) }
+        let previousKeys = previousKey.map { [$0] } ?? []
+
+        return uniqueStrings(previousKeys + geometryKeys)
+            .filter { $0 != primaryKey }
     }
 
     private func persistenceKey(for split: DetectedSplit, windowName: String) -> String {
@@ -982,25 +1254,54 @@ private final class LabelController {
 
     private func bestExistingSplitID(for detectedSplit: DetectedSplit, excluding usedIDs: Set<SplitID>) -> SplitID? {
         var bestMatch: (id: SplitID, score: CGFloat)?
+        let detectedRelativeBounds = relativeBounds(for: detectedSplit.bounds, in: detectedSplit.windowBounds)
 
-        for (splitID, previousBounds) in knownBoundsBySplitID where !usedIDs.contains(splitID) {
-            let previousWindowBounds = knownWindowBoundsBySplitID[splitID] ?? .null
-            let sameWindowScore = samePhysicalWindow(previousWindowBounds, detectedSplit.windowBounds) ? CGFloat(600) : 0
-            let windowOverlapScore = intersectionOverUnion(previousWindowBounds, detectedSplit.windowBounds) * 300
-            let splitOverlapScore = intersectionOverUnion(previousBounds, detectedSplit.bounds) * 1000
-            let splitFrameScore = samePhysicalWindow(previousBounds, detectedSplit.bounds) ? CGFloat(500) : 0
-            let score = sameWindowScore + windowOverlapScore + splitOverlapScore + splitFrameScore
+        for (splitID, previousRelativeBounds) in knownRelativeBoundsBySplitID where !usedIDs.contains(splitID) {
+            let relativeOverlapScore = intersectionOverUnion(previousRelativeBounds, detectedRelativeBounds) * 1000
+            let relativeFrameScore = sameRelativeSplit(previousRelativeBounds, detectedRelativeBounds) ? CGFloat(500) : 0
+            let score = relativeOverlapScore + relativeFrameScore
 
             if bestMatch == nil || score > bestMatch!.score {
                 bestMatch = (splitID, score)
             }
         }
 
-        guard let bestMatch, bestMatch.score >= 250 else {
+        guard let bestMatch, bestMatch.score >= 500 else {
             return nil
         }
 
         return bestMatch.id
+    }
+
+    private func relativeBounds(for frame: CGRect, in window: CGRect) -> CGRect {
+        guard window.width > 0, window.height > 0 else {
+            return frame
+        }
+
+        return CGRect(
+            x: (frame.minX - window.minX) / window.width,
+            y: (frame.minY - window.minY) / window.height,
+            width: frame.width / window.width,
+            height: frame.height / window.height
+        )
+    }
+
+    private func parseRelativePersistenceKey(_ key: String) -> ParsedRelativePersistenceKey? {
+        let parts = key.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 6,
+              parts[1] == "relative",
+              let x = Double(parts[2]),
+              let y = Double(parts[3]),
+              let width = Double(parts[4]),
+              let height = Double(parts[5])
+        else {
+            return nil
+        }
+
+        return ParsedRelativePersistenceKey(
+            windowName: String(parts[0]),
+            bounds: CGRect(x: x, y: y, width: width, height: height)
+        )
     }
 
     private func newSplitID() -> SplitID {
@@ -1238,6 +1539,13 @@ private func samePhysicalWindow(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
         abs(lhs.minY - rhs.minY) <= 8 &&
         abs(lhs.width - rhs.width) <= 16 &&
         abs(lhs.height - rhs.height) <= 16
+}
+
+private func sameRelativeSplit(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+    abs(lhs.minX - rhs.minX) <= 0.02 &&
+        abs(lhs.minY - rhs.minY) <= 0.02 &&
+        abs(lhs.width - rhs.width) <= 0.03 &&
+        abs(lhs.height - rhs.height) <= 0.03
 }
 
 private func intersectionOverUnion(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
