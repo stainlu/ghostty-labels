@@ -204,7 +204,7 @@ private final class LabelWindow: NSPanel {
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        level = .statusBar
+        level = .floating
         badgeView.onClick = { [weak self] in
             guard let self else { return }
             debugLog("ghostty-labels: badge mouseDown split=\(self.splitID)")
